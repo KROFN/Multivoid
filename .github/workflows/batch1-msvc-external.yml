@@ -1,0 +1,202 @@
+name: batch1-msvc-external
+
+on:
+  push:
+    branches:
+      - import/batch1-e99-carrier
+    paths:
+      - '.github/workflows/batch1-msvc-external.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: batch1-msvc-external
+  cancel-in-progress: false
+
+jobs:
+  contract:
+    name: Exact-tree contract + Windows x64 Release
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      SOURCE_SHA: 1308aa5919d5e53fd9ba75eeb88370b0378da720
+      SOURCE_TREE: 60996e9f24ad24e4caf6ae1d24b282c89896c785
+      VCPKG_ROOT: ${{ github.workspace }}\vcpkg-tool
+      VCPKG_TRIPLET: x64-windows-static
+      BUILD_DIR: build/votv-coop
+
+    steps:
+      - name: Checkout exact reconstructed Batch-1 source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: 1308aa5919d5e53fd9ba75eeb88370b0378da720
+          submodules: false
+          fetch-depth: 0
+
+      - name: Verify exact source commit and tree
+        shell: pwsh
+        run: |
+          $head = (git rev-parse HEAD).Trim()
+          $tree = (git rev-parse 'HEAD^{tree}').Trim()
+          Write-Host "HEAD=$head"
+          Write-Host "TREE=$tree"
+          if ($head -ne $env:SOURCE_SHA) { throw "source commit mismatch: $head" }
+          if ($tree -ne $env:SOURCE_TREE) { throw "source tree mismatch: $tree" }
+
+      - name: Init build submodules (third_party only)
+        shell: pwsh
+        run: git submodule update --init --recursive src/votv-coop/third_party
+
+      - name: MSVC dev environment
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x64
+
+      - name: Restore pinned VCPKG_ROOT after VS environment setup
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:GITHUB_WORKSPACE 'vcpkg-tool'
+          "VCPKG_ROOT=$root" | Out-File -Append $env:GITHUB_ENV
+          Write-Host "Pinned vcpkg root restored to $root"
+
+      - name: LOGIC PASS (pure protocol/logic matrix)
+        working-directory: src/votv-coop
+        shell: cmd
+        run: |
+          cl /nologo /EHsc /std:c++20 /utf-8 /W3 /I include ^
+            tests\batch1_corrective_selftest.cpp ^
+            src\coop\items\save_record_wire.cpp ^
+            src\coop\interactables\signal_wire.cpp ^
+            /Fe:${{ github.workspace }}\batch1_logic.exe
+          ${{ github.workspace }}\batch1_logic.exe
+
+      - name: MODEL PASS (fakes + real pure cores)
+        working-directory: src/votv-coop
+        shell: cmd
+        run: |
+          cl /nologo /EHsc /std:c++20 /utf-8 /W3 /I include ^
+            tests\batch1_model_selftest.cpp ^
+            src\coop\items\save_record_wire.cpp ^
+            src\coop\interactables\signal_wire.cpp ^
+            /Fe:${{ github.workspace }}\batch1_model.exe
+          ${{ github.workspace }}\batch1_model.exe
+
+      - name: FUZZ PASS (seeded property runner, 10000 scenarios)
+        working-directory: src/votv-coop
+        shell: cmd
+        run: |
+          cl /nologo /EHsc /std:c++20 /utf-8 /W3 /O1 /I include ^
+            tests\batch1_fuzz_selftest.cpp ^
+            src\coop\items\save_record_wire.cpp ^
+            src\coop\interactables\signal_wire.cpp ^
+            /Fe:${{ github.workspace }}\batch1_fuzz.exe
+          ${{ github.workspace }}\batch1_fuzz.exe 10000 0xB1F00D5EED
+
+      - name: BUILD-GRAPH PASS (integration gate)
+        shell: pwsh
+        working-directory: src/votv-coop
+        run: |
+          python ..\..\tools\batch1\integration_gate.py
+          exit $LASTEXITCODE
+
+      - name: Read vcpkg pin
+        id: baseline
+        shell: pwsh
+        run: |
+          $baseline = (Get-Content src/votv-coop/vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
+          if ($baseline -notmatch '^[0-9a-f]{40}$') { throw "bad builtin-baseline: '$baseline'" }
+          Write-Host "vcpkg pin = $baseline"
+          "sha=$baseline" | Out-File -Append $env:GITHUB_OUTPUT
+
+      - name: Detect Visual Studio toolchain
+        id: vs
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $major = & $vswhere -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property catalog_productLineVersion
+          if (-not $major) { $major = & $vswhere -latest -property catalog_productLineVersion }
+          $major = "$major".Trim()
+          $yearMap = @{ '16' = '2019'; '17' = '2022'; '18' = '2026'; '19' = '2029' }
+          $year = $yearMap[$major]
+          if (-not $year) { throw "Unrecognized Visual Studio major '$major'" }
+          $generator = "Visual Studio $major $year"
+          $inst = & $vswhere -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $toolset = (Get-Content (Join-Path "$inst".Trim() 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt') -Raw).Trim()
+          Write-Host "generator=$generator toolset=$toolset image=$env:ImageVersion"
+          "generator=$generator" | Out-File -Append $env:GITHUB_OUTPUT
+          "toolset=$toolset" | Out-File -Append $env:GITHUB_OUTPUT
+          "image=$env:ImageVersion" | Out-File -Append $env:GITHUB_OUTPUT
+
+      - name: Restore vcpkg tool cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.VCPKG_ROOT }}
+          key: vcpkg-tool-${{ steps.baseline.outputs.sha }}-${{ steps.vs.outputs.image }}
+
+      - name: Install pinned vcpkg
+        shell: pwsh
+        run: |
+          $pin = '${{ steps.baseline.outputs.sha }}'
+          Write-Host "VCPKG_ROOT=$env:VCPKG_ROOT"
+          if (-not (Test-Path "$env:VCPKG_ROOT\.git")) {
+            if (Test-Path $env:VCPKG_ROOT) { Remove-Item -Recurse -Force $env:VCPKG_ROOT }
+            git clone https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
+          }
+          $cur = (git -C $env:VCPKG_ROOT rev-parse HEAD).Trim()
+          if ($cur -ne $pin) {
+            git -C $env:VCPKG_ROOT fetch origin $pin
+            git -C $env:VCPKG_ROOT checkout --force $pin
+          }
+          if (-not (Test-Path "$env:VCPKG_ROOT\vcpkg.exe")) {
+            & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+            if ($LASTEXITCODE -ne 0) { throw 'bootstrap-vcpkg failed' }
+          }
+          Write-Host "vcpkg at $((git -C $env:VCPKG_ROOT rev-parse HEAD).Trim())"
+
+      - name: Restore vcpkg_installed cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.BUILD_DIR }}/vcpkg_installed
+          key: vcpkg-installed-${{ hashFiles('src/votv-coop/vcpkg.json') }}-${{ steps.vs.outputs.image }}-${{ steps.vs.outputs.toolset }}
+
+      - name: Configure (CMake + pinned vcpkg)
+        shell: pwsh
+        run: |
+          cmake -S src/votv-coop -B ${{ env.BUILD_DIR }} `
+            -G "${{ steps.vs.outputs.generator }}" -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="${{ env.VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=${{ env.VCPKG_TRIPLET }} `
+            -DVCPKG_MANIFEST_MODE=ON
+
+      - name: MSVC COMPILE + LINK PASS (Release DLL)
+        shell: pwsh
+        run: cmake --build ${{ env.BUILD_DIR }} --config Release
+
+      - name: Collect artifacts + hashes
+        id: artname
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'artifact'
+          New-Item -ItemType Directory $out | Out-Null
+          $dlls = @(Get-ChildItem "${{ env.BUILD_DIR }}/Release/*.dll")
+          if ($dlls.Count -eq 0) { throw 'no DLLs produced' }
+          foreach ($d in $dlls) {
+            Copy-Item $d.FullName $out
+            $h = (Get-FileHash -Algorithm SHA256 $d.FullName).Hash.ToLowerInvariant()
+            Write-Host "$($d.Name)  sha256=$h"
+          }
+          "commit: $env:SOURCE_SHA" | Out-File (Join-Path $out 'build-info.txt')
+          "tree: $env:SOURCE_TREE" | Out-File -Append (Join-Path $out 'build-info.txt')
+          "runner-workflow: batch1-msvc-external" | Out-File -Append (Join-Path $out 'build-info.txt')
+          "name=batch1-contract-$($env:SOURCE_SHA.Substring(0,12))" | Out-File -Append $env:GITHUB_OUTPUT
+          "dir=$out" | Out-File -Append $env:GITHUB_OUTPUT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.artname.outputs.name }}
+          path: ${{ steps.artname.outputs.dir }}
+          retention-days: 30
+          if-no-files-found: error
