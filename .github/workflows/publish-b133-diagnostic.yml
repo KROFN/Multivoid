@@ -1,0 +1,51 @@
+name: publish-b133-diagnostic
+
+on:
+  push:
+    branches:
+      - diag/wine-headless-getwindowtext-b133
+    paths:
+      - .github/workflows/publish-b133-diagnostic.yml
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download successful MSVC artifact from run 33327649968
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api /repos/KROFN/Multivoid/actions/artifacts/9737152379/zip > artifact.zip
+          mkdir artifact
+          unzip -q artifact.zip -d artifact
+          sha256sum artifact/*
+          test -f artifact/multivoid-0.9.0n-133.dll
+          test -f artifact/build-info.txt
+          grep -F 'commit: 4f8c6b3fbabc03a7a90306d6745f744ddf2f44b0' artifact/build-info.txt
+
+      - name: Publish immutable diagnostic prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG='diag-b133-wine-headless-4f8c6b3f'
+          REPO='KROFN/Multivoid'
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "release $TAG already exists"
+            exit 0
+          fi
+          gh release create "$TAG" \
+            artifact/multivoid-0.9.0n-133.dll \
+            artifact/build-info.txt \
+            artifact/fingerprint-dump.json \
+            artifact.zip \
+            --repo "$REPO" \
+            --target 4f8c6b3fbabc03a7a90306d6745f744ddf2f44b0 \
+            --prerelease \
+            --title 'b133 Wine headless GetWindowText diagnostic' \
+            --notes 'Diagnostic-only MSVC build for Node2 Wine testing. Built by GitHub Actions from commit 4f8c6b3fbabc03a7a90306d6745f744ddf2f44b0. The source patch is based on upstream v0.9.0n-b133-dev and skips only the GetWindowTextW diagnostic call when VOTVCOOP_HEADLESS_SKIP_WINDOW_TITLE=1. Keep the official b133 xinput1_3.dll; replace only multivoid-0.9.0n-133.dll for the test.'
