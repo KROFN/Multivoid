@@ -1,0 +1,170 @@
+# batch1-test-contract.yml -- KROFNE FORK (2133): the Batch-1 TEST CONTRACT CI lane.
+#
+# WHY A BRANCH-LOCAL WORKFLOW: build.yml dispatches build-core.yml with the REMOTE form
+# (VOTV-MP/Multivoid/.github/workflows/build-core.yml@main) -- a remote `uses:` always
+# resolves from UPSTREAM main, so a fork branch cannot extend the shared build. This
+# workflow is therefore self-contained: the full contract pipeline + the MSVC Release
+# DLL build, inline.
+#
+# GREEN MEANS ALL OF:
+#   LOGIC PASS     (tests/batch1_corrective_selftest.cpp  -- the pure protocol/logic matrix)
+#   MODEL PASS     (tests/batch1_model_selftest.cpp       -- fakes + real cores, invariants)
+#   FUZZ PASS      (tests/batch1_fuzz_selftest.cpp        -- seeded property runner, 10k)
+#   BUILD-GRAPH PASS (tools/batch1/integration_gate.py    -- the gate runs FIRST, before the
+#                    expensive vcpkg/GNS dependency build)
+#   MSVC COMPILE PASS + MSVC LINK PASS (CMake Release -- the DLL itself)
+# and the DLL is uploaded as a workflow artifact.
+#
+# The pure/model/fuzz suites compile with MSVC here (cl /std:c++20) -- the same toolchain
+# that builds the DLL, so the suites also gate MSVC compatibility of the pure headers.
+# (A Linux g++ syntax-only run is NOT a build success and is not used as one.)
+
+name: batch1-test-contract
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'krofne/**'
+
+concurrency:
+  group: batch1-contract-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    name: Test contract + Windows x64 Release
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}\vcpkg-tool
+      VCPKG_TRIPLET: x64-windows-static
+      BUILD_DIR: build/votv-coop
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: false
+          fetch-depth: 0
+
+      - name: Init build submodules (third_party only)
+        shell: pwsh
+        run: git submodule update --init --recursive src/votv-coop/third_party
+
+      - name: MSVC dev environment
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x64
+
+      # ---------- the TEST CONTRACT (cheap; runs before any dependency build) ----------
+
+      - name: LOGIC PASS (pure protocol/logic matrix)
+        working-directory: src/votv-coop
+        shell: cmd
+        run: |
+          cl /nologo /EHsc /std:c++20 /utf-8 /W3 /I include ^
+            tests\batch1_corrective_selftest.cpp ^
+            src\coop\items\save_record_wire.cpp ^
+            src\coop\interactables\signal_wire.cpp ^
+            /Fe:${{ github.workspace }}\batch1_logic.exe
+          ${{ github.workspace }}\batch1_logic.exe
+
+      - name: MODEL PASS (fakes + real pure cores, invariants after every event)
+        working-directory: src/votv-coop
+        shell: cmd
+        run: |
+          cl /nologo /EHsc /std:c++20 /utf-8 /W3 /I include ^
+            tests\batch1_model_selftest.cpp ^
+            src\coop\items\save_record_wire.cpp ^
+            src\coop\interactables\signal_wire.cpp ^
+            /Fe:${{ github.workspace }}\batch1_model.exe
+          ${{ github.workspace }}\batch1_model.exe
+
+      - name: FUZZ PASS (seeded property runner, 10000 scenarios)
+        working-directory: src/votv-coop
+        shell: cmd
+        run: |
+          cl /nologo /EHsc /std:c++20 /utf-8 /W3 /O1 /I include ^
+            tests\batch1_fuzz_selftest.cpp ^
+            src\coop\items\save_record_wire.cpp ^
+            src\coop\interactables\signal_wire.cpp ^
+            /Fe:${{ github.workspace }}\batch1_fuzz.exe
+          ${{ github.workspace }}\batch1_fuzz.exe 10000 0xB1F00D5EED
+
+      - name: BUILD-GRAPH PASS (integration gate)
+        shell: pwsh
+        working-directory: src/votv-coop
+        run: |
+          python ..\..\tools\batch1\integration_gate.py
+          exit $LASTEXITCODE
+
+      # ---------- the DLL (expensive: vcpkg + GNS + webrtc) ----------
+
+      - name: Read vcpkg pin (builtin-baseline from vcpkg.json)
+        id: baseline
+        shell: pwsh
+        run: |
+          $baseline = (Get-Content src/votv-coop/vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
+          if ($baseline -notmatch '^[0-9a-f]{40}$') { throw "bad builtin-baseline: '$baseline'" }
+          Write-Host "vcpkg pin = $baseline"
+          "sha=$baseline" | Out-File -Append $env:GITHUB_OUTPUT
+
+      - name: Install vcpkg (clone + checkout the baseline pin + bootstrap)
+        shell: pwsh
+        run: |
+          $pin = '${{ steps.baseline.outputs.sha }}'
+          if (-not (Test-Path "$env:VCPKG_ROOT\.git")) {
+            git clone https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
+          }
+          $cur = (git -C $env:VCPKG_ROOT rev-parse HEAD).Trim()
+          if ($cur -ne $pin) {
+            git -C $env:VCPKG_ROOT fetch origin $pin
+            git -C $env:VCPKG_ROOT checkout --force $pin
+          }
+          if (-not (Test-Path "$env:VCPKG_ROOT\vcpkg.exe")) {
+            & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+            if ($LASTEXITCODE -ne 0) { throw 'bootstrap-vcpkg failed' }
+          }
+
+      - name: Configure (CMake + vcpkg manifest mode)
+        shell: pwsh
+        run: |
+          cmake -S src/votv-coop -B ${{ env.BUILD_DIR }} `
+            -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="${{ env.VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=${{ env.VCPKG_TRIPLET }} `
+            -DVCPKG_MANIFEST_MODE=ON
+
+      - name: MSVC COMPILE + LINK PASS (Release DLL)
+        shell: pwsh
+        run: cmake --build ${{ env.BUILD_DIR }} --config Release
+
+      - name: Collect artifacts + toolchain dump
+        id: artname
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'artifact'
+          New-Item -ItemType Directory $out | Out-Null
+          $dlls = @(Get-ChildItem "${{ env.BUILD_DIR }}/Release/*.dll")
+          if ($dlls.Count -eq 0) { throw 'no DLLs produced' }
+          foreach ($d in $dlls) {
+            Copy-Item $d.FullName $out
+            $h = (Get-FileHash -Algorithm SHA256 $d.FullName).Hash.ToLowerInvariant()
+            Write-Host "$($d.Name)  sha256=$h"
+          }
+          $head = (git rev-parse HEAD).Trim()
+          "commit: $head" | Out-File (Join-Path $out 'build-info.txt')
+          "name=batch1-contract-$($head.Substring(0,12))" | Out-File -Append $env:GITHUB_OUTPUT
+          "dir=$out" | Out-File -Append $env:GITHUB_OUTPUT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.artname.outputs.name }}
+          path: ${{ steps.artname.outputs.dir }}
+          retention-days: 30
+          if-no-files-found: error
