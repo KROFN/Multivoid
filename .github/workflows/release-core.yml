@@ -108,8 +108,9 @@ jobs:
     name: Cacheless build of the tagged source
     needs: judge
     if: needs.judge.outputs.verdict == 'publish'
-    # Remote@main form on purpose (R22) -- same rule as the callers of this file.
-    uses: VOTV-MP/Multivoid/.github/workflows/build-core.yml@main
+    # KROFNE FORK (2133) PIN: b133 source SHA (tag v0.9.0n-b133-dev), NOT @main --
+    # upstream-main gates previously broke a correct b133 diagnostic build.
+    uses: VOTV-MP/Multivoid/.github/workflows/build-core.yml@2f32d1affb9bdf10447d9145c166b4832d1e449f
     with:
       ref: ${{ needs.judge.outputs.tag-sha }}
       source-sha: ${{ needs.judge.outputs.tag-sha }}
