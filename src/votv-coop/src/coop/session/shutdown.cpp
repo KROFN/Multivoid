@@ -162,9 +162,21 @@ void Install(coop::net::Session* session) {
     // Re-title on new HWND.
     g_titled = false;
 
-    // Diagnostic dump.
+    // Diagnostic dump. Wine can deadlock GetWindowTextW here when this boot thread
+    // queries the same-process UnrealWindow owned by the UI thread. Keep the normal
+    // Windows behavior unless the explicit headless diagnostic gate is set.
     wchar_t title[128] = {};
-    ::GetWindowTextW(best, title, 128);
+    wchar_t skipWindowTitle[8] = {};
+    const DWORD skipLen = ::GetEnvironmentVariableW(
+        L"VOTVCOOP_HEADLESS_SKIP_WINDOW_TITLE", skipWindowTitle, 8);
+    const bool skipWindowTitleDiag = skipLen > 0 && skipWindowTitle[0] == L'1';
+    if (skipWindowTitleDiag) {
+        UE_LOGI("BOOTCHK shutdown: skipping GetWindowTextW diagnostic on HWND=%p", best);
+    } else {
+        UE_LOGI("BOOTCHK shutdown: GetWindowTextW enter HWND=%p", best);
+        ::GetWindowTextW(best, title, 128);
+        UE_LOGI("BOOTCHK shutdown: GetWindowTextW return HWND=%p", best);
+    }
     RECT r{};
     ::GetWindowRect(best, &r);
     UE_LOGI("shutdown: subclassed HWND=%p title='%ls' rect=(%ld,%ld %ldx%ld) origProc=%p",
