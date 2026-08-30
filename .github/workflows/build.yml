@@ -4,8 +4,13 @@
 # PR's history. Reworked per the maintainers' design: MANUAL-ONLY
 # (workflow_dispatch; the nightly cron was deliberately dropped -- builds are
 # human-paced), and a THIN entry so the CI lane and the release lane share ONE
-# build implementation (build-core@main, remote form on purpose -- a
-# local-path uses: would resolve from the triggering branch).
+# build implementation (remote form on purpose -- a local-path uses: would
+# resolve from the triggering branch).
+# KROFNE FORK (2133) PIN: build-core.yml is pinned to the b133 source SHA
+# 2f32d1affb9bdf10447d9145c166b4832d1e449f (= tag v0.9.0n-b133-dev), NOT @main:
+# upstream-main gates previously broke a correct b133 diagnostic build. The
+# branch-local batch1-test-contract.yml is the payload lane; this file stays
+# pinned for any diagnostic dispatch.
 # Artifacts are CI evidence, NOT distribution -- releases are the supported
 # install channel.
 name: build
@@ -28,7 +33,7 @@ permissions:
 
 jobs:
   build:
-    uses: VOTV-MP/Multivoid/.github/workflows/build-core.yml@main
+    uses: VOTV-MP/Multivoid/.github/workflows/build-core.yml@2f32d1affb9bdf10447d9145c166b4832d1e449f # b133 pin (tag v0.9.0n-b133-dev); NEVER @main
     with:
       ref: ${{ github.sha }}
       source-sha: ${{ github.sha }}
