@@ -1,9 +1,6 @@
 name: diagnostic-msvc
 
 on:
-  push:
-    branches:
-      - diag/wine-headless-getwindowtext-b133
   workflow_dispatch:
 
 permissions:
