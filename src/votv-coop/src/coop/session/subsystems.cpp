@@ -72,6 +72,7 @@
 #include "coop/interactables/interactable_sync.h"
 #include "coop/interactables/atv_sync.h"
 #include "coop/interactables/drone_sync.h"
+#include "coop/interactables/drone_take_sync.h"  // KROFNE FORK (2133): the drone take request lane
 #include "coop/items/order_sync.h"
 #include "coop/world/event_cue_sync.h"
 #include "coop/world/event_fire_sync.h"
@@ -99,6 +100,7 @@
 #include "coop/player/item_activate.h"
 #include "coop/player/player_damage.h"
 #include "coop/net/session.h"
+#include "coop/net/send_backlog.h"  // KROFNE FORK v3 (blocker N): fork-critical send retries
 #include "coop/creatures/npc_adoption.h"
 #include "coop/creatures/kerfur_prop_adoption.h"  // K-6
 #include "coop/creatures/npc_mirror.h"
@@ -141,6 +143,7 @@ void Install(coop::net::Session& session) {
     coop::power_sync::Install(&session);     // v46 base power-panel breakers (its own module -- 5 bools)
     coop::atv_sync::Install(&session);       // v47 ATV body pose (occupant-authoritative keyed stream)
     coop::drone_sync::Install(&session);     // v48 delivery drone body pose (host-authoritative singleton)
+    coop::drone_take_sync::Install(&session);  // KROFNE FORK (2133): the drone TAKE causal lane (BUG 1+3)
     coop::order_sync::Install(&session);     // v49 delivery-drone economy: client->host shop-order forward
     coop::firefly_sync::Install(&session);   // v51 peer-symmetric ambient firefly mirror (each peer captures+shares its own)
     coop::event_cue_sync::Install(&session); // v79 HOST-AUTH cosmetic emitter-cue mirror (B1: starfall etc. -- host detects PSC, client replays)
@@ -377,6 +380,13 @@ void DisconnectSlot(coop::net::Session& session, int slot) {
     coop::comp_sync::OnPeerDisconnect(static_cast<uint8_t>(slot));  // v65: pause the mirror if the decode simulator left
     coop::kerfur_command::OnPeerDisconnect(static_cast<uint8_t>(slot));  // v74: release any kerfur the leaver was owned-following
     coop::voice_chat::OnDisconnectSlot(slot);  // v66: drop the leaver's voice channel + icon state
+    coop::drone_take_sync::OnDisconnectForSlot(slot);  // KROFNE FORK: wipe the leaver's drone-take
+                                    // replay domain (a rejoining client on a reused slot starts fresh)
+    coop::props::container_contents_sync::OnDisconnectForSlot(slot);  // KROFNE FORK v3 (blocker L):
+                                    // drop the leaver's extraction pairing state (slot+generation identity)
+    coop::net::send_backlog::OnDisconnectForSlot(slot);  // KROFNE FORK (review finding S): purge the
+                                    // leaver's parked critical sends -- the slot's SUCCESSOR must never
+                                    // receive the previous occupant's verdicts/intents
     coop::sleep_sync::OnDisconnectForSlot(slot);  // v71: drop the leaver from the sleep tally (re-gate)
     coop::owner_entity_sync::OnPeerLeftSlot(slot);  // v108: destroy the leaver's owner-entity mirrors (its eyer dies with it)
     coop::player_inventory_sync::OnDisconnectForSlot(slot);  // v73: flush the leaver's inventory to <guid>.json
@@ -417,6 +427,7 @@ DisconnectStats DisconnectAll() {
     coop::power_sync::OnDisconnect();
     coop::atv_sync::OnDisconnect();
     coop::drone_sync::OnDisconnect();
+    coop::drone_take_sync::OnDisconnect();   // KROFNE FORK: drop the pending take request (phantoms stay)
     coop::order_sync::OnDisconnect();
     coop::firefly_sync::OnDisconnect();
     coop::event_cue_sync::OnDisconnect();    // v79 clear the cosmetic-cue poll snapshot
@@ -437,6 +448,7 @@ DisconnectStats DisconnectAll() {
     coop::laptop_buffer_sync::OnDisconnect(); // v121: quad shadow + assembler + selftest
     coop::floppybox_sync::OnDisconnect();     // v121: box shadows + taken-ring + pendings
     coop::props::container_contents_sync::OnDisconnect();  // v124: dirty set + retry + parked + assembler
+    coop::net::send_backlog::OnDisconnect();               // KROFNE FORK v3 (blocker N): parked critical sends die with the session
     coop::dev::container_selftest::OnDisconnect();         // [dev] re-arm the R11b circle on reconnect
     coop::desk_cursor_sync::OnDisconnect();
     coop::desk_sim_sync::OnDisconnect();
@@ -490,6 +502,8 @@ void TickGameplay(coop::net::Session& session, bool isConnected, bool isHost,
     { PP::Scope _s{PP::Bucket::Interactable}; ue_wrap::ScopedWalkTimer _w{"sync:power"}; coop::power_sync::Tick(); }          // v46 base power panel: poll breaker edges + deferred-apply retry (symmetric)
     { PP::Scope _s{PP::Bucket::Interactable}; ue_wrap::ScopedWalkTimer _w{"sync:atv"}; coop::atv_sync::Tick(); }            // v47 ATV: occupant streams its pose / mirror drives the interp (host+client)
     { PP::Scope _s{PP::Bucket::Interactable}; ue_wrap::ScopedWalkTimer _w{"sync:drone"}; coop::drone_sync::Tick(); }          // v48 delivery drone: host streams transform / client suppresses tick + mirrors
+    { PP::Scope _s{PP::Bucket::Interactable}; coop::drone_take_sync::Tick(); }  // KROFNE FORK: lazily arm the 0x45 take observation + capture hook + verdict expiry
+    { PP::Scope _s{PP::Bucket::Interactable}; coop::net::send_backlog::Tick(&session); }  // KROFNE FORK v3 (blocker N): retry refused fork-critical sends (near-free when empty)
     { PP::Scope _s{PP::Bucket::Interactable}; ue_wrap::ScopedWalkTimer _w{"sync:turbine"}; coop::turbine_sync::Tick(); }        // v61 wind turbines: host ~1 Hz driver-float poll / client deferred-apply retry
     { PP::Scope _s{PP::Bucket::Interactable}; ue_wrap::ScopedWalkTimer _w{"sync:event_cue"}; coop::event_cue_sync::Tick(); }      // v79 cosmetic event cues (B1): host ~1 Hz new-PSC poll -> EventCue broadcast (host-only, no-op on client)
     { PP::Scope _s{PP::Bucket::Interactable}; ue_wrap::ScopedWalkTimer _w{"sync:event_fire"}; coop::event_fire_sync::Tick(); }     // v95 scheduled events: host 1 Hz passEvents growth poll -> EventFire / client allEvents suppress + replay drain

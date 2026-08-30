@@ -5,20 +5,29 @@
 #include "coop/element/registry.h"
 #include "coop/items/save_record_wire.h"
 #include "coop/net/blob_chunks.h"
+#include "coop/net/send_backlog.h"          // KROFNE FORK v3 (blocker N): critical-send retries
 #include "coop/net/session.h"
+#include "coop/props/container_extract_wire.h"  // KROFNE FORK v3 (blocker K): the pure blob grammar
+#include "coop/dev/batch1_smoke.h"          // KROFNE FORK: B1_* diagnostic milestones (log-only)
+#include "coop/props/extract_pairing.h"     // KROFNE FORK v3 (blockers L+M): the pairing ledger
+#include "coop/props/prop_drop_intent.h"  // KROFNE FORK: SpawnExtractionBirth (the paired-birth author)
 #include "coop/session/net_pump.h"
 #include "ue_wrap/actors/inventory.h"     // ResolveSaveSlot
 #include "ue_wrap/actors/prop.h"          // WalksToBase
 #include "ue_wrap/actors/save_record.h"
 #include "ue_wrap/core/component_calls.h"  // CallParamless
+#include "ue_wrap/core/game_thread.h"      // KROFNE FORK: IsGameThread + Post (extractor re-derive)
+#include "ue_wrap/core/hot_path_guard.h"   // KROFNE FORK: UE_ASSERT_GAME_THREAD (pairing ingest)
 #include "ue_wrap/core/log.h"
 #include "ue_wrap/core/reflection.h"
 #include "ue_wrap/core/vm_dispatch.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <set>
 #include <string>
@@ -30,14 +39,22 @@ namespace {
 namespace R  = ue_wrap::reflection;
 namespace SR = ue_wrap::save_record;
 namespace W  = coop::save_record_wire;
+namespace XW = coop::props::container_extract_wire;
+namespace XP = coop::props::extract_pairing;
 namespace vm = ue_wrap::vm_dispatch;
+namespace GT = ue_wrap::game_thread;
 
 using coop::element::LivePropActor;
 
-constexpr uint8_t kOpContents = 0;
+// Blob op constants + the token-tail cap live in container_extract_wire.h (the pure grammar
+// header the corrective selftest compiles directly -- blocker K).
 
-// One verb id: both watched verbs share one callback (mark-dirty), so they need no distinction.
-constexpr int kVerbDirty = 1;
+// Two verb ids now: both watched verbs share one callback (mark-dirty), but the KROFNE FORK
+// extraction lane must distinguish takeObj (the EXTRACTION birth cause) from addObject, and the
+// extractor-side re-derive only makes sense after a take. The ids are module-local (the Bracket
+// echoes them back); no other consumer sees them.
+constexpr int kVerbDirty = 1;   // addObject: the insert edge (dirty-mark only)
+constexpr int kVerbTake  = 2;   // takeObj: the extraction edge (dirty-mark + birth causality + re-derive)
 
 // The sweep is the drain of an edge-driven set, not a poll -- it does no work when nothing was
 // dispatched. 250 ms keeps a burst of addLoot/addObject calls (a loot roll fires addObject x4)
@@ -105,6 +122,79 @@ std::set<uint32_t> g_retry;
 // that raced a host-side change; the client uses nothing but its own bookkeeping.
 std::map<uint32_t, uint64_t> g_localChangeMs;
 
+// Blob ops: kOpContents = 0 is the b133 grammar, kOpContentsExtract = 1 the FORK grammar with
+// the extraction-token tail. Both constants (and the tail cap) live in the pure wire header
+// (container_extract_wire.h) now; the CONTENT hash always hashes the op=0 pack, so tokens are
+// never part of content identity.
+
+// KROFNE FORK (blocker E): client-side extraction-token state (GT-only).
+uint64_t g_nextExtractToken = 0;                       // monotonic per client session (starts at 1)
+std::map<uint32_t, std::deque<uint64_t>> g_queuedExtractTokens;  // eid -> tokens awaiting their write
+uint64_t g_currentTakeToken = 0;                       // token minted at the CURRENT takeObj edge
+uint32_t g_currentTakeEid   = 0;                       //   and the container it ran on
+constexpr uint64_t kExtractTokenTtlMs = 10000;         // unshipped tokens expire (their birth rejects)
+std::map<uint32_t, uint64_t> g_firstQueuedTokenMs;     // eid -> age anchor for the queue head
+
+// KROFNE FORK (blockers L+M, v3): HOST-side pairing state is the PURE LEDGER
+// (coop/props/extract_pairing.h -- headless-selftested). v2 keyed its three maps by the RAW
+// token alone, so client slot 1's token 1 and client slot 2's token 1 COLLIDED (the 3-4 player
+// use case was broken by construction), and a successful commit never sent its kOk (client
+// ghosts leaked forever). The ledger owns: the ExtractKey{slot, generation, token} identity,
+// exactly-once births, both arrival orders, the refuse/expiry answers, and the bounded
+// post-accept birth recovery. This TU wires the ledger's sinks to the transport and the
+// birth author, and logs its outcomes.
+XP::Ledger g_ledger;
+
+// The production sinks. ResultSink -> send_backlog (blocker N: a refused result send retries;
+// a rejected client must not keep a ghost merely because one GNS queue attempt failed).
+// BirthSink -> prop_drop_intent::SpawnExtractionBirth (the v3 BirthVerdict author).
+namespace {
+struct PairingSinks final : XP::ResultSink, XP::BirthSink {
+    void SendExtractResult(uint8_t toSlot,
+                           const coop::net::ContainerExtractResultPayload& p) override {
+        auto* s = g_session.load(std::memory_order_acquire);
+        if (!s) return;
+        if (p.accepted && p.reason == coop::net::container_extract_result::kOk)
+            coop::dev::batch1_smoke::Emit("B1_EXTRACT_BIRTH_COMMIT", "token=%llu slot=%u",
+                                          static_cast<unsigned long long>(p.extractToken),
+                                          static_cast<unsigned>(toSlot));
+        coop::dev::batch1_smoke::Emit("B1_EXTRACT_RESULT", "token=%llu accepted=%u reason=%u",
+                                      static_cast<unsigned long long>(p.extractToken),
+                                      static_cast<unsigned>(p.accepted),
+                                      static_cast<unsigned>(p.reason));
+        coop::net::send_backlog::SendCritical(*s, coop::net::ReliableKind::ContainerExtractResult,
+                                              static_cast<int>(toSlot), &p, sizeof(p));
+    }
+    XP::BirthVerdict AuthorBirth(const coop::net::ContainerExtractIntentPayload& p,
+                                 uint8_t senderSlot) override {
+        auto* s = g_session.load(std::memory_order_acquire);
+        if (!s) return XP::BirthVerdict::TransientFailure;
+        return coop::prop_drop_intent::SpawnExtractionBirth(*s, p, senderSlot);
+    }
+};
+PairingSinks g_pairingSinks;
+}  // namespace
+
+// The ExtractKey for a (slot, token) at the CURRENT moment: the slot's occupancy generation is
+// captured ONCE at arrival, so a slot reuse after a disconnect is a different key domain (and
+// OnDisconnectForSlot wipes the leaver's pending state outright).
+XP::ExtractKey ExtractKeyFor(uint8_t senderSlot, uint64_t token) {
+    XP::ExtractKey key;
+    key.senderSlot = senderSlot;
+    key.token      = token;
+    auto* s = g_session.load(std::memory_order_acquire);
+    key.generation = s ? s->peerGenerationForSlot(static_cast<int>(senderSlot)) : 0;
+    return key;
+}
+
+// KROFNE FORK (FIX F): trailing/coalesced extractor re-derive. Every take edge MARKS its eid
+// here; a posted drain (coalesced to one per pump) re-derives everything marked, so the FINAL
+// mutation in a burst always gets its run -- the old 250 ms skip-window could drop the trailing
+// state. Re-derive is read-only derivation (updateVolumesAndMass -> Get Volume only, never
+// takeObj), so it cannot re-enter the edge or re-mark.
+std::set<uint32_t> g_rederivePending;
+bool g_rederiveDrainPosted = false;
+
 // A client write whose baseHash is stale is rejected within this window of a host-side change.
 constexpr uint64_t kConflictWindowMs = 1500;
 
@@ -116,7 +206,16 @@ constexpr uint64_t kConflictWindowMs = 1500;
 uint64_t g_conflictRejects = 0;
 
 // Inbound blobs for an eid not yet resolvable (birth skew / mid-activity join, principle 8).
-struct Parked { std::vector<uint8_t> blob; std::chrono::steady_clock::time_point at; };
+// authorSlot (v3): the ORIGINAL author is preserved so a parked client-authored op=1 write
+// replays under its own slot (and pairs its extraction tokens with the RIGHT ledger key) when
+// the eid resolves -- replaying it as slot 0 would silently strand its pairing (v2 did exactly
+// that: the deferred write applied but its birth never committed). Host/relay blobs park with
+// authorSlot 0 (the client applies host truth; tokens are not its business).
+struct Parked {
+    std::vector<uint8_t> blob;
+    std::chrono::steady_clock::time_point at;
+    uint8_t authorSlot = 0;
+};
 std::map<uint32_t, Parked> g_parked;
 constexpr int kParkTtlSec = 30;
 
@@ -293,11 +392,9 @@ void NeuterNestedIndex(SR::SaveRecord& r) {
 }
 
 // ---- blob grammar ----------------------------------------------------------------------------
-
-void AppU16(std::vector<uint8_t>& b, uint16_t v) {
-    b.push_back(static_cast<uint8_t>(v & 0xFF));
-    b.push_back(static_cast<uint8_t>(v >> 8));
-}
+// (The blob packers + the LE primitives now live in the pure wire header
+// container_extract_wire.h -- blocker K carve-out. ParseAndApply reads baseHash via
+// XW::RdU64LE below; nothing in this TU appends the header fields by hand anymore.)
 
 bool ReadContents(void* inv, std::vector<SR::SaveRecord>& out) {
     uint8_t* slot = GObjStackSlot(inv);
@@ -319,41 +416,12 @@ bool ReadContents(void* inv, std::vector<SR::SaveRecord>& out) {
     return true;
 }
 
-void AppU64(std::vector<uint8_t>& b, uint64_t v) {
-    for (int i = 0; i < 8; ++i) b.push_back(static_cast<uint8_t>((v >> (i * 8)) & 0xFF));
-}
-
-bool RdU64(const std::vector<uint8_t>& b, size_t& o, uint64_t& v) {
-    if (o + 8 > b.size()) return false;
-    v = 0;
-    for (int i = 0; i < 8; ++i) v |= static_cast<uint64_t>(b[o + i]) << (i * 8);
-    o += 8;
-    return true;
-}
-
-// `baseHash` = the last truth for this eid that the AUTHOR had applied from the host (0 when the
-// author is the host itself, or when the author has never applied anything for this eid). It is
-// what lets the host distinguish "the client edited the world I published" from "the client
-// edited a world that has since moved on" -- without it a full-slice write from a stale author
-// would silently erase a host addition the author had not yet received.
-std::vector<uint8_t> PackContents(uint32_t eid, uint64_t baseHash,
-                                  const std::vector<SR::SaveRecord>& recs) {
-    std::vector<uint8_t> b;
-    b.push_back(kOpContents);
-    W::AppU32(b, eid);
-    AppU64(b, baseHash);
-    AppU16(b, static_cast<uint16_t>(recs.size()));
-    for (const auto& r : recs) W::SerSave(b, r);
-    return b;
-}
-
-// THE hash every gate and every compare-and-swap uses. It is taken over a pack with baseHash
-// ZEROED, so it names the CONTENTS ALONE: the same records must hash the same no matter which
-// peer authored them or what base that author edited from. Hashing the raw blob instead would
-// make an author's private bookkeeping part of the content identity, and the host's CAS would
-// then compare two quantities that can never be equal.
+// The blob packers moved to the PURE wire header (container_extract_wire.h, blocker K) so the
+// corrective selftest runs the exact production pack/parse pair headless. ContentHash keeps its
+// definition-shape: Fnv64 over the op=0 pack with baseHash ZEROED -- the byte layout is
+// unchanged, so every previously published hash still matches.
 uint64_t ContentHash(uint32_t eid, const std::vector<SR::SaveRecord>& recs) {
-    return coop::blob_chunks::Fnv64(PackContents(eid, 0, recs));
+    return coop::blob_chunks::Fnv64(XW::PackContents(eid, 0, recs));
 }
 
 // ---- host: broadcast one container -----------------------------------------------------------
@@ -372,7 +440,24 @@ bool BroadcastContainer(coop::net::Session* s, uint32_t eid, void* inv, int toSl
         auto it = g_baseHash.find(eid);
         if (it != g_baseHash.end()) baseHash = it->second;
     }
-    const std::vector<uint8_t> blob = PackContents(eid, baseHash, recs);
+    // KROFNE FORK (blocker E): a CLIENT's fan-out IS the author->arbiter edge -- attach this
+    // container's queued extraction tokens (op=1 pack) so the host can pair the write with its
+    // parked extraction birth. Tokens pop ONLY on a successful send (a transport-refused write
+    // retries with the same tokens); the unchanged early-return keeps them too -- the take that
+    // minted them always changes the contents, so unchanged-write-with-tokens is a should-never
+    // state the token TTL sweep cleans up.
+    std::vector<uint64_t> extractTokens;
+    if (!IsHost() && toSlot < 0) {
+        auto qit = g_queuedExtractTokens.find(eid);
+        if (qit != g_queuedExtractTokens.end() && !qit->second.empty()) {
+            const size_t n = std::min(qit->second.size(), XW::kMaxTokensPerWrite);
+            extractTokens.assign(qit->second.begin(),
+                                 qit->second.begin() + static_cast<std::ptrdiff_t>(n));
+        }
+    }
+    const std::vector<uint8_t> blob = extractTokens.empty()
+        ? XW::PackContents(eid, baseHash, recs)
+        : XW::PackContentsExtract(eid, baseHash, recs, extractTokens);
     const uint64_t h = ContentHash(eid, recs);
     if (!force) {
         auto it = g_sentHash.find(eid);
@@ -389,6 +474,20 @@ bool BroadcastContainer(coop::net::Session* s, uint32_t eid, void* inv, int toSl
         : coop::blob_chunks::SendBlobToSlot(s, toSlot, coop::net::ReliableKind::ContainerContents,
                                             g_nextSeq++, blob);
     if (ok) {
+        if (!extractTokens.empty()) {
+            // Shipped: retire exactly the tokens that went out (the queue may hold newer ones).
+            auto qit = g_queuedExtractTokens.find(eid);
+            if (qit != g_queuedExtractTokens.end()) {
+                for (size_t i = 0; i < extractTokens.size() && !qit->second.empty(); ++i)
+                    qit->second.pop_front();
+                if (qit->second.empty()) {
+                    g_queuedExtractTokens.erase(qit);
+                    g_firstQueuedTokenMs.erase(eid);
+                } else {
+                    g_firstQueuedTokenMs[eid] = NowMs();   // restart the TTL anchor
+                }
+            }
+        }
         if (toSlot < 0) g_sentHash[eid] = h;  // only a FAN-OUT establishes what every peer has
         // ...but ANY publication -- fan-out or a targeted connect seed -- establishes what the
         // RECEIVER was told, and that is the baseline a later client write must be judged against.
@@ -568,7 +667,27 @@ Ingest ApplyContents(uint32_t eid, const std::vector<SR::SaveRecord>& recs, uint
 
     g_appliedHash[eid] = blobHash;
     // The base a later local edit will declare. Set here and NEVER cleared by our own verb edge.
-    if (!IsHost()) g_baseHash[eid] = blobHash;
+    if (!IsHost()) {
+        g_baseHash[eid] = blobHash;
+        // KROFNE FORK (test-contract pass, FUZZ FINDING): authoritative host truth just
+        // OVERWROTE this client's local container. Any extraction token still QUEUED (not yet
+        // riding a sent write) described a local mutation this truth may have just undone -- if
+        // such a token rode a LATER write, the host would pair it with a write that no longer
+        // removed the item and birth a duplicate that is ALSO still in the container. Cancel
+        // the unsent queue: the already-parked intents expire through the normal pairing TTL
+        // (honest kExpired -> ghost retire), and the item is wherever THIS truth says it is.
+        // Tokens already popped onto a sent write are NOT affected -- their pairing follows the
+        // CAS/ledger rules.
+        auto qit = g_queuedExtractTokens.find(eid);
+        if (qit != g_queuedExtractTokens.end() && !qit->second.empty()) {
+            UE_LOGW("container_contents: eid=%u host truth applied with %zu queued extraction "
+                    "token(s) -- UNSENT queue cancelled (their intents expire via the pairing "
+                    "TTL); tokens already riding a sent write are unaffected",
+                    eid, qit->second.size());
+            g_firstQueuedTokenMs.erase(eid);
+            g_queuedExtractTokens.erase(qit);
+        }
+    }
     RederiveManagedState(OwnerOf(inv), inv);
     UE_LOGI("container_contents: eid=%u applied %d records", eid, n);
     return Ingest::Applied;
@@ -611,47 +730,107 @@ bool HostAcceptsClientWrite(uint32_t eid, uint64_t baseHash, uint8_t authorSlot)
     return false;
 }
 
+// KROFNE FORK (blockers L+M, v3): the pairing commit machinery lives in the PURE LEDGER
+// (extract_pairing.h): ExtractKey{slot, generation, token} identity, exactly-once births, both
+// arrival orders, refuse/expiry answers, and the bounded post-accept birth recovery. This TU's
+// ParseAndApply feeds it; ParkExtractionBirth (below) is the intent-arrival adapter.
+
 Ingest ParseAndApply(const std::vector<uint8_t>& blob, uint32_t& outEid, uint8_t senderSlot) {
-    size_t o = 0;
-    uint8_t op = 0;
-    if (!W::RdU8(blob, o, op) || op != kOpContents) return Ingest::Handled;  // unknown op
-    if (!W::RdU32(blob, o, outEid)) return Ingest::Handled;
-    uint64_t baseHash = 0;
-    if (!RdU64(blob, o, baseHash)) return Ingest::Handled;
+    // BLOCKER K (v3): the WHOLE blob is structurally parsed and validated BEFORE any side
+    // effect. Forward, unambiguous: header -> exactly nRecords -> the op=1 tail at the CURRENT
+    // offset -> exact final offset. The v2 parser read the tail's count from the blob's LAST
+    // BYTE (the final token's most-significant byte -- 0 for every normal little-endian token),
+    // so every well-formed op=1 blob was deterministically rejected as malformed.
+    XW::ParsedBlob pb;
+    if (!XW::ParseContentsBlob(blob, kMaxRecordsPerContainer, pb)) {
+        UE_LOGW("container_contents: blob for eid=%u is structurally invalid (bad header, bad "
+                "record stream, malformed/missing token tail, or trailing bytes) -- dropped "
+                "WHOLESALE, no CAS/pairing side effects", outEid);
+        return Ingest::Handled;
+    }
+    outEid = pb.eid;
+
+    // KROFNE FORK (test-contract pass, FUZZ FINDING): a FORK write (op=1, token tail) whose
+    // SENDER no longer occupies the slot is a STALE-GENERATION remnant. The GNS queue dies with
+    // the connection, but a write already dispatched to the game thread can be processed AFTER
+    // the disconnect event -- and keying its tokens against the CURRENT (new/empty) occupancy
+    // divorces them from the parked intent forever: the mutation would apply (the item leaves
+    // the host container) with NO birth and NO verdict possible -- an unbacked, unannounced
+    // loss. Fail CLOSED instead: refuse the WHOLE write before any CAS/pairing side effect and
+    // re-publish the host's own truth (the item stays where it was).
+    if (IsHost() && senderSlot != 0 && senderSlot < coop::net::kMaxPeers && !pb.tokens.empty()) {
+        auto* s = g_session.load(std::memory_order_acquire);
+        if (!s || s->peerGenerationForSlot(senderSlot) == 0) {
+            UE_LOGW("container_contents: extraction write for eid=%u from slot=%u processed after "
+                    "the sender's occupancy ended (stale generation) -- refused WHOLE, no "
+                    "CAS/pairing side effects; the item stays in the host container", outEid,
+                    static_cast<unsigned>(senderSlot));
+            void* actor = LivePropActor(outEid);
+            void* inv = actor && IsContainerActor(actor) ? InventoryOf(actor) : nullptr;
+            if (s && inv && IsWorldContainerInventory(inv)) {
+                BroadcastContainer(s, outEid, inv, static_cast<int>(senderSlot), /*force=*/true);
+            }
+            return Ingest::Handled;
+        }
+    }
+
     // HOST arbitration: a client-authored slice is validated BEFORE it touches anything. A refusal
     // is not silent -- the host immediately re-publishes its own truth so the refused author
     // converges instead of sitting on a divergent view.
-    if (IsHost() && senderSlot != 0 && !HostAcceptsClientWrite(outEid, baseHash, senderSlot)) {
+    if (IsHost() && senderSlot != 0 && !HostAcceptsClientWrite(outEid, pb.baseHash, senderSlot)) {
         auto* s = g_session.load(std::memory_order_acquire);
         void* actor = LivePropActor(outEid);
         void* inv = actor && IsContainerActor(actor) ? InventoryOf(actor) : nullptr;
         if (s && inv && IsWorldContainerInventory(inv)) {
             BroadcastContainer(s, outEid, inv, static_cast<int>(senderSlot), /*force=*/true);
         }
+        // KROFNE FORK (blocker E + L): the write was refused -> its paired extraction tokens are
+        // REFUSED with it (the item stays in the host's container; the author's local ghost is
+        // retired via the result). The ledger answers kRefused per key (slot+generation bound,
+        // through the backlog) and drops ALL pairing state for them. Never spawn on a refused
+        // mutation. Out-of-range slots cannot hold pairing state -- skipped defensively.
+        if (senderSlot < coop::net::kMaxPeers && !pb.tokens.empty()) {
+            std::vector<XP::ExtractKey> keys;
+            keys.reserve(pb.tokens.size());
+            for (uint64_t t : pb.tokens) keys.push_back(ExtractKeyFor(senderSlot, t));
+            g_ledger.OnWriteRefused(keys, g_pairingSinks);
+            for (uint64_t t : pb.tokens)
+                UE_LOGW("container_contents: extraction token=%llu REFUSED (paired write refused) "
+                        "-- no birth; reject ordered to slot %u",
+                        static_cast<unsigned long long>(t), static_cast<unsigned>(senderSlot));
+        }
         // Handled, NOT Applied: this must never be relayed onward. Third peers run no CAS.
         return Ingest::Handled;
     }
-    if (o + 2 > blob.size()) return Ingest::Handled;
-    const uint16_t n = static_cast<uint16_t>(blob[o] | (blob[o + 1] << 8));
-    o += 2;
-    if (n > kMaxRecordsPerContainer || !W::Feasible(n, blob, o)) {
-        UE_LOGW("container_contents: eid=%u declares %u records -- rejected", outEid, n);
-        return Ingest::Handled;
-    }
-    std::vector<SR::SaveRecord> recs(n);
-    for (auto& r : recs) {
-        if (!W::DeSave(blob, o, r)) {
-            UE_LOGW("container_contents: eid=%u malformed record stream -- dropped", outEid);
-            return Ingest::Handled;
-        }
-    }
-    const uint64_t contentHash = ContentHash(outEid, recs);
-    const Ingest outcome = ApplyContents(outEid, recs, contentHash);
+
+    const uint64_t contentHash = ContentHash(outEid, pb.recs);
+    const Ingest outcome = ApplyContents(outEid, pb.recs, contentHash);
     // HOST, client-authored + ACCEPTED: this content is now the host's published truth. Recording
     // it here (not at the chunk seam) is what keeps the host's own drain from re-broadcasting the
     // identical slice back out to everyone -- which would reach the author the long way round and
     // stomp whatever it had done since.
-    if (outcome == Ingest::Applied && IsHost() && senderSlot != 0) g_sentHash[outEid] = contentHash;
+    if (outcome == Ingest::Applied && IsHost() && senderSlot != 0) {
+        g_sentHash[outEid] = contentHash;
+        // KROFNE FORK (blocker E + L + M): the paired mutation is APPLIED -- now (and only now)
+        // may the extracted world birth(s) commit, keyed by (slot, generation, token). The ledger
+        // authors each birth AT MOST ONCE, answers kOk to the originating slot on success (the
+        // client's terminal state), and parks transient birth failures for the bounded retry.
+        if (senderSlot < coop::net::kMaxPeers && !pb.tokens.empty()) {
+            coop::dev::batch1_smoke::Emit("B1_EXTRACT_MUTATION_APPLIED",
+                                          "eid=%u slot=%u tokens=%zu", outEid,
+                                          static_cast<unsigned>(senderSlot), pb.tokens.size());
+            std::vector<XP::ExtractKey> keys;
+            keys.reserve(pb.tokens.size());
+            for (uint64_t t : pb.tokens) keys.push_back(ExtractKeyFor(senderSlot, t));
+            const XP::Ledger::WriteReport rep =
+                g_ledger.OnWriteApplied(keys, outEid, NowMs(), g_pairingSinks, g_pairingSinks);
+            UE_LOGI("container_contents: extraction write APPLIED slot=%u eid=%u tokens=%zu -- "
+                    "committed=%zu pending=%zu marked=%zu dups=%zu mismatches=%zu",
+                    static_cast<unsigned>(senderSlot), outEid, pb.tokens.size(),
+                    rep.committed, rep.birthsPending, rep.markedApplied, rep.duplicates,
+                    rep.mismatches);
+        }
+    }
     return outcome;
 }
 
@@ -660,10 +839,11 @@ void SweepParked() {
     const auto now = std::chrono::steady_clock::now();
     for (auto it = g_parked.begin(); it != g_parked.end();) {
         uint32_t eid = 0;
-        // A parked blob is always one a RECEIVER could not resolve yet; the host never parks a
-        // client write (a refused one is answered immediately, an accepted one applies at once),
-        // so slot 0 is the correct author for every replay here.
-        if (ParseAndApply(it->second.blob, eid, /*senderSlot=*/0) != Ingest::Park) {
+        // Replay under the blob's ORIGINAL author (v3): host/relay blobs were parked with slot 0
+        // (a client applies host truth, tokens are not its business); a parked CLIENT-authored
+        // op=1 write replays under its own slot so its extraction tokens pair under the RIGHT
+        // ledger key -- replaying it as slot 0 would silently strand its pairing (v2's hole).
+        if (ParseAndApply(it->second.blob, eid, it->second.authorSlot) != Ingest::Park) {
             it = g_parked.erase(it);
         } else if (now - it->second.at > std::chrono::seconds(kParkTtlSec)) {
             UE_LOGW("container_contents: parked eid=%u expired after %ds unresolved -- dropped",
@@ -714,6 +894,61 @@ void OnVerbEntry(const vm::Bracket& br) {
         static_cast<uint32_t>(coop::element::Registry::Get().EidForActor(owner));
     if (eid == static_cast<uint32_t>(coop::element::kInvalidId)) return;
     g_dirty.insert(eid);   // resolve identity AT THE EDGE; deref nothing later
+
+    // KROFNE FORK (batch-1C + corrective E/F): the EXTRACTION edge. A client's takeObj on a
+    // synced WORLD container is about to birth an Aprop_C into the world INSIDE this verb body
+    // (native spawn, synchronous with the dispatch) -- and the b133 client birth pipeline drops
+    // that birth on the floor, so the item existed only on the extracting peer. Two things must
+    // happen HERE, at the edge, before the spawn:
+    //   (E) MINT THE CORRELATION TOKEN. The token rides BOTH the client's next contents write for
+    //       this eid (op=1 tail) AND the birth intent -- the host authors the birth ONLY when the
+    //       paired mutation is Applied (a refused stale write must never duplicate the item).
+    //       g_currentTake{Token,Eid} is what prop_drop_intent's FinishSpawn hook reads DURING the
+    //       bracket (via CurrentExtraction) to bind the birth to the token.
+    //   (F) MARK the eid for the trailing re-derive: a posted, coalesced drain re-derives every
+    //       marked container after the native mutations land -- the FINAL mutation in a burst
+    //       always gets its run (the old 250 ms skip-window could drop it). updateVolumesAndMass
+    //       is measured to call only `Get Volume` (never takeObj), so the re-derive cannot
+    //       re-enter this edge or re-mark.
+    if (br.verbId == kVerbTake) {
+        if (!IsHost()) {
+            const uint64_t token = ++g_nextExtractToken;
+            g_currentTakeToken = token;
+            g_currentTakeEid   = eid;
+            coop::dev::batch1_smoke::Emit("B1_EXTRACT_EDGE", "token=%llu eid=%u",
+                                          static_cast<unsigned long long>(token), eid);
+            auto& q = g_queuedExtractTokens[eid];
+            if (q.size() >= XW::kMaxTokensPerWrite * 2) {
+                UE_LOGW("container_contents: eid=%u extraction-token queue overflow -- dropping "
+                        "token %llu (its birth will reject-expire)", eid,
+                        static_cast<unsigned long long>(q.front()));
+                q.pop_front();
+            }
+            if (q.empty()) g_firstQueuedTokenMs[eid] = NowMs();
+            q.push_back(token);
+            UE_LOGI("container_contents: CLIENT take edge on synced world container eid=%u -- "
+                    "extraction token %llu minted (rides the next write + the birth intent)",
+                    eid, static_cast<unsigned long long>(token));
+        }
+        g_rederivePending.insert(eid);
+        if (!g_rederiveDrainPosted) {
+            g_rederiveDrainPosted = true;
+            GT::Post([]() {
+                g_rederiveDrainPosted = false;
+                std::set<uint32_t> pending;
+                pending.swap(g_rederivePending);
+                for (uint32_t markedEid : pending) {
+                    void* actor = LivePropActor(markedEid);
+                    if (!actor || !IsContainerActor(actor)) continue;      // died / not a container anymore
+                    void* inv = InventoryOf(actor);
+                    if (!inv || !IsWorldContainerInventory(inv)) continue; // BOUNDARY 1, fail-closed
+                    RederiveManagedState(actor, inv);
+                    UE_LOGI("container_contents: extractor-edge re-derive ran for eid=%u "
+                            "(currVol/names)", markedEid);
+                }
+            });
+        }
+    }
     // Stamp the LOCAL change so the host can tell a stale client write (an author that had not
     // yet seen the host's own newer change) from a clean one. This is the conflict instrument.
     g_localChangeMs[eid] = NowMs();
@@ -729,6 +964,10 @@ void OnVerbEntry(const vm::Bracket& br) {
 
 }  // namespace
 
+// TU-internal (declared here because Tick's body precedes the definition): the pairing-window
+// sweep for the extraction correlation state.
+static void SweepExtractionPairing(uint64_t nowMs);
+
 void Install(coop::net::Session* session) {
     g_session.store(session, std::memory_order_release);
 }
@@ -740,7 +979,7 @@ void Tick() {
     if (!g_verbsRegistered) {
         g_verbsRegistered =
             vm::RegisterVirtualVerb(L"addObject", kVerbDirty, &OnVerbEntry) &&
-            vm::RegisterVirtualVerb(L"takeObj",   kVerbDirty, &OnVerbEntry);
+            vm::RegisterVirtualVerb(L"takeObj",   kVerbTake,  &OnVerbEntry);
         if (!g_verbsRegistered)
             UE_LOGW("container_contents: verb registration FAILED -- the lane is inert");
     }
@@ -760,6 +999,7 @@ void Tick() {
     g_nextSweep = now + kSweepMs;
 
     g_asm.Sweep(std::chrono::steady_clock::now(), std::chrono::seconds(10));
+    SweepExtractionPairing(now);   // KROFNE FORK (blocker E): parked/marked extraction pairing TTLs
 
     // v125: BOTH peers drain. On the host the drain fans its own changes out; on a client the
     // same drain ships the container IT mutated to the host, which arbitrates and relays. A
@@ -793,7 +1033,7 @@ void OnContentsChunk(const coop::net::BlobChunkPayload& p, uint8_t senderSlot) {
     if (outcome == Ingest::Park) {
         // Birth skew / mid-activity join: the container's element is not bound yet. Park it
         // (latest wins per eid) and let the sweep retry until the TTL.
-        g_parked[eid] = Parked{std::move(blob), std::chrono::steady_clock::now()};
+        g_parked[eid] = Parked{std::move(blob), std::chrono::steady_clock::now(), senderSlot};
         UE_LOGI("container_contents: eid=%u not resolvable yet -- parked (TTL %ds)", eid, kParkTtlSec);
         return;
     }
@@ -824,6 +1064,124 @@ void QueueConnectBroadcastForSlot(int peerSlot) {
         if (BroadcastContainer(s, static_cast<uint32_t>(pr.id), inv, peerSlot, /*force=*/true)) ++sent;
     }
     UE_LOGI("container_contents: connect seed -> slot %d: %zu world containers", peerSlot, sent);
+}
+
+// ---- KROFNE FORK (batch-1C): the extraction-birth causality query ------------------------------
+// Called from prop_drop_intent's CLIENT FinishSpawningActor post-hook WHILE a native takeObj verb
+// body is dispatching (the spawn happens synchronously inside it). True iff the CURRENT thread's
+// innermost vm_dispatch verb is THIS module's takeObj edge on a SYNCED WORLD container's inventory
+// component -- i.e. "the birth you are looking at was caused by a client extraction". This is the
+// narrow causal gate that lets an extractor's world birth through the client->host authoring
+// pipeline WITHOUT opening a blanket client-birth allow: personal inventory (BOUNDARY 1),
+// untracked (non-synced) containers, addObject, and any other verb/class all return false.
+bool IsClientTakeObjExtractionActive() {
+    if (!GT::IsGameThread()) return false;
+    auto* s = g_session.load(std::memory_order_acquire);
+    if (!s || !s->connected() || s->role() != coop::net::Role::Client) return false;
+    const vm::ActiveVerb av = vm::CurrentThreadVerb();
+    if (!av.active || av.verbId != kVerbTake || !av.ctx) return false;
+    if (!IsInventoryComponent(av.ctx)) return false;          // a propInventory component at all
+    if (!IsWorldContainerInventory(av.ctx)) return false;     // BOUNDARY 1 (fail-closed), never personal
+    void* owner = OwnerOf(av.ctx);
+    if (!owner) return false;
+    return coop::element::Registry::Get().EidForActor(owner) != coop::element::kInvalidId;  // synced
+}
+
+// ---- KROFNE FORK (blocker E): the extraction pairing API --------------------------------------
+
+void CurrentExtraction(uint64_t& outToken, uint32_t& outEid) {
+    outToken = g_currentTakeToken;
+    outEid   = g_currentTakeEid;
+}
+
+bool ParkExtractionBirth(const coop::net::ContainerExtractIntentPayload& p, uint8_t senderSlot) {
+    UE_ASSERT_GAME_THREAD("container_contents_sync::ParkExtractionBirth");
+    auto* s = g_session.load(std::memory_order_acquire);
+    if (!s || !IsHost()) return false;                         // host-only pairing
+    if (p.extractToken == 0) return false;                     // token 0 is never valid
+    if (senderSlot == 0 || senderSlot >= coop::net::kMaxPeers) return false;
+
+    // Stale-occupancy guard (test-contract pass, FUZZ FINDING; mirrors the write-side guard in
+    // ParseAndApply): an intent processed after its sender's occupancy ended can never pair --
+    // its paired write is refused by the same guard, so parking it would only expire noisily.
+    // Fail closed: no pairing state for a ghost occupant.
+    if (s->peerGenerationForSlot(senderSlot) == 0) {
+        UE_LOGW("container_contents: extract intent token=%llu from slot=%u processed after the "
+                "sender's occupancy ended (stale generation) -- refused, no pairing state",
+                static_cast<unsigned long long>(p.extractToken), static_cast<unsigned>(senderSlot));
+        return false;
+    }
+
+    // BLOCKER L: the key binds (slot, occupancy generation, token). Two clients minting the same
+    // token, or a reused slot after a disconnect, are DIFFERENT keys -- no collision, no
+    // cross-client suppression, and the leaver's pending state died with OnDisconnectForSlot.
+    const XP::ExtractKey key = ExtractKeyFor(senderSlot, p.extractToken);
+    const XP::ParkResult r =
+        g_ledger.ParkIntent(key, p.containerEid, p, NowMs(), g_pairingSinks, g_pairingSinks);
+    switch (r) {
+    case XP::ParkResult::Parked:
+        UE_LOGI("container_contents: extract intent token=%llu slot=%u gen=%u eid=%u PARKED -- "
+                "awaiting the paired contents mutation (order: intent-first)",
+                static_cast<unsigned long long>(p.extractToken), static_cast<unsigned>(senderSlot),
+                key.generation, p.containerEid);
+        return true;
+    case XP::ParkResult::CommittedNow:
+        UE_LOGI("container_contents: extract intent token=%llu arrived AFTER its accepted write "
+                "-- committed now (birth authored, kOk ordered)",
+                static_cast<unsigned long long>(p.extractToken));
+        return true;
+    case XP::ParkResult::BirthPending:
+        UE_LOGW("container_contents: extract intent token=%llu paired write-first, but the birth "
+                "author is transiently failing -- bounded retry armed",
+                static_cast<unsigned long long>(p.extractToken));
+        return true;
+    case XP::ParkResult::DuplicateCommitted:
+        UE_LOGW("container_contents: extract intent token=%llu from slot %u -- key ALREADY "
+                "committed, ignored (exactly-once)",
+                static_cast<unsigned long long>(p.extractToken), static_cast<unsigned>(senderSlot));
+        return false;
+    case XP::ParkResult::SlotEidMismatch:
+        UE_LOGW("container_contents: extract intent token=%llu slot/eid mismatch vs the applied "
+                "marker -- dropped", static_cast<unsigned long long>(p.extractToken));
+        return false;
+    case XP::ParkResult::ZeroToken:
+        return false;
+    }
+    return false;
+}
+
+// The pairing window sweeps + the bounded birth-retry pump now live in the ledger; this local
+// sweep keeps only the CLIENT-side queued-token TTL (a stale token must never ride a LATER
+// write) and relays the ledger's report into the log.
+static void SweepExtractionPairing(uint64_t nowMs) {
+    const XP::Ledger::SweepReport rep =
+        g_ledger.Sweep(nowMs, g_pairingSinks, g_pairingSinks);
+    if (rep.expiredParked)
+        UE_LOGW("container_contents: %zu parked extraction intent(s) EXPIRED without their paired "
+                "mutation -- kExpired sent per each; the host container truth stands",
+                rep.expiredParked);
+    if (rep.expiredApplied)
+        UE_LOGW("container_contents: %zu accepted extraction write(s) never received their birth "
+                "intent within the window -- those items exist only client-side now",
+                rep.expiredApplied);
+    if (rep.birthRetries || rep.birthsCommitted)
+        UE_LOGI("container_contents: extraction birth retries=%zu committed=%zu (pending=%zu)",
+                rep.birthRetries, rep.birthsCommitted, g_ledger.BirthRetryCount());
+    if (rep.birthsFailed)
+        UE_LOGW("container_contents: %zu extraction birth(s) FAILED their bounded post-accept "
+                "recovery -- kBirthFailed sent per each; THE ITEM IS IN NEITHER PLACE (host "
+                "container already debited) -- investigate the spawn path",
+                rep.birthsFailed);
+    // Client-side: unshipped queued tokens expire so a stale token can never ride a LATER write.
+    for (auto qit = g_queuedExtractTokens.begin(); qit != g_queuedExtractTokens.end();) {
+        auto fit = g_firstQueuedTokenMs.find(qit->first);
+        if (fit == g_firstQueuedTokenMs.end()) { qit = g_queuedExtractTokens.erase(qit); continue; }
+        if (nowMs - fit->second <= kExtractTokenTtlMs) { ++qit; continue; }
+        UE_LOGW("container_contents: eid=%u queued extraction tokens EXPIRED unshipped (%zu) -- "
+                "their births will reject-expire", qit->first, qit->second.size());
+        g_firstQueuedTokenMs.erase(fit);
+        qit = g_queuedExtractTokens.erase(qit);
+    }
 }
 
 // ---- dev-instrument seams (see the header) -----------------------------------------------------
@@ -865,6 +1223,15 @@ void OnDisconnect() {
     g_dirty.clear();
     g_retry.clear();
     g_localChangeMs.clear();
+    // KROFNE FORK (corrective pass): the extraction pairing state dies with the session.
+    g_nextExtractToken = 0;
+    g_queuedExtractTokens.clear();
+    g_firstQueuedTokenMs.clear();
+    g_currentTakeToken = 0;
+    g_currentTakeEid = 0;
+    g_ledger.Clear();
+    g_rederivePending.clear();
+    g_rederiveDrainPosted = false;
     g_conflictRejects = 0;
     g_parked.clear();
     g_sentHash.clear();
@@ -874,6 +1241,25 @@ void OnDisconnect() {
     g_asm.Clear();
     g_nextSweep = 0;
     g_announced = false;
+}
+
+void OnDisconnectForSlot(int slot) {
+    UE_ASSERT_GAME_THREAD("container_contents_sync::OnDisconnectForSlot");
+    if (slot <= 0 || slot >= coop::net::kMaxPeers) return;
+    // BLOCKER L: the LEAVER's pending extraction pairing state dies with their occupancy --
+    // parked intents, applied markers, and bounded birth retries alike. The slot's next
+    // occupant (a new generation) starts a fresh identity domain; nothing of the previous
+    // occupant can pair, commit, or answer into the new one.
+    const size_t parked = g_ledger.ParkedCount(), applied = g_ledger.AppliedCount(),
+                 retry = g_ledger.BirthRetryCount();
+    g_ledger.OnDisconnectForSlot(static_cast<uint8_t>(slot));
+    if (parked != g_ledger.ParkedCount() || applied != g_ledger.AppliedCount() ||
+        retry != g_ledger.BirthRetryCount()) {
+        UE_LOGI("container_contents: slot %u left -- its extraction pairing state dropped "
+                "(parked/applied/retry before=%zu/%zu/%zu, after=%zu/%zu/%zu)",
+                slot, parked, applied, retry, g_ledger.ParkedCount(), g_ledger.AppliedCount(),
+                g_ledger.BirthRetryCount());
+    }
 }
 
 }  // namespace coop::props::container_contents_sync

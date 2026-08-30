@@ -163,12 +163,35 @@ void Install(coop::net::Session* session) {
     g_titled = false;
 
     // Diagnostic dump.
+    //
+    // NODE2/WINE HEADLESS GATE -- explicit opt-in, evaluated ONCE (thread-safe magic static;
+    // the environment is boot-stable and Install() runs per-tick, so no repeated env reads).
+    // Root cause (runtime-proven on Wine, Node2): USER32!GetWindowTextW on a same-process
+    // window owned by ANOTHER thread dispatches WM_GETTEXT to the owning (UI) thread and
+    // BLOCKS the caller until that thread pumps messages. harness::Start -> Install() runs
+    // on the boot thread while the UI thread has not pumped yet -> permanent boot hang.
+    // When the gate is active: skip ONLY the title query below (a diagnostic field);
+    // GetWindowRect still runs, and subclassing (SetWindowLongPtrW/CoopWndProc), the
+    // shutdown handler (DoShutdown), networking/config/TimelineThread/ImGui and the
+    // game-thread pump are untouched. Any value other than the exact L"1" -- including the
+    // variable being absent -- keeps the stock behavior byte-identical.
+    static const bool s_headlessSkipWindowTitle = [] {
+        wchar_t v[8] = {};
+        const DWORD n = ::GetEnvironmentVariableW(L"VOTVCOOP_HEADLESS_SKIP_WINDOW_TITLE", v, 8);
+        return n == 1 && v[0] == L'1';
+    }();
     wchar_t title[128] = {};
-    ::GetWindowTextW(best, title, 128);
+    if (s_headlessSkipWindowTitle) {
+        UE_LOGI("shutdown: BOOTCHK headless-skip-window-title=1 -- GetWindowTextW skipped "
+                "(Wine cross-thread WM_GETTEXT hang avoidance) HWND=%p", best);
+    } else {
+        ::GetWindowTextW(best, title, 128);
+    }
     RECT r{};
     ::GetWindowRect(best, &r);
     UE_LOGI("shutdown: subclassed HWND=%p title='%ls' rect=(%ld,%ld %ldx%ld) origProc=%p",
-            best, title, r.left, r.top, r.right - r.left, r.bottom - r.top, orig);
+            best, s_headlessSkipWindowTitle ? L"<headless-skipped>" : title,
+            r.left, r.top, r.right - r.left, r.bottom - r.top, orig);
 }
 
 void UpdateWindowTitle() {

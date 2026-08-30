@@ -154,6 +154,17 @@ inline Lane LaneForKind(ReliableKind k) {
     // references -- a contents blob for an eid whose PropSpawn has not landed parks and retries,
     // so keeping it in the one Normal FIFO makes the park the rare case, not the norm.
     case ReliableKind::ContainerContents: return Lane::Normal;
+    // KROFNE FORK (batch-1, protocol 2133): the drone take is a CAUSAL gameplay action (the same
+    // priority family as DoorOpenRequest/TeleportClient -- a player is standing at the drone waiting
+    // for the verdict, and the client's phantom reconcile hangs off the reply). The extraction
+    // intent rides Bulk with the other prop-birth intents (PropDropIntent/ReelEjectIntent): a birth
+    // is world-state, not a blocking interaction.
+    case ReliableKind::DroneActionRequest:  return Lane::High;
+    case ReliableKind::DroneActionResult:   return Lane::High;
+    case ReliableKind::ContainerExtractIntent: return Lane::Bulk;
+    // KROFNE FORK (corrective E): the extraction pairing verdict -- the client waits on it to
+    // clean its local ghost, so it rides High with the other verdict traffic.
+    case ReliableKind::ContainerExtractResult: return Lane::High;
     default:                           return Lane::Normal;
     }
 }

@@ -7,6 +7,7 @@
 // early-returns) + the atv_sync LerpWindow interp. No index (one drone).
 
 #include "coop/interactables/drone_sync.h"
+#include "coop/interactables/drone_take_sync.h"  // KROFNE FORK: streamed-gate note (tripwire reference)
 
 #include "coop/element/lerp_window.h"
 #include "coop/net/protocol.h"
@@ -159,9 +160,23 @@ void OnReliable(const coop::net::DroneStatePayload& payload) {
     const bool canTakeOff = (nb & D::kFxArrived) != 0;
     const bool hasSack    = (nb & D::kFxHasSack) != 0;
 
-    // Interaction gate: write canTakeOff (THE gate) + hasSack (option prerequisite) onto the mirror so
-    // a parked drone is interactable instead of "in motion" (the suppressed tick never sets them).
-    D::WriteGateFields(drone, canTakeOff, hasSack);
+    // BLOCKER O (v3): while OUR take request is pending, the mirrored hasSack gate is MASKED
+    // to false. The local dropSack body already ran (one phantom captured, one request in
+    // flight); vm_dispatch observation is NOT a cancellation, so a re-armed Take option would
+    // let a second press run the native body AGAIN -- a second local sack the exactly-one
+    // capture cannot absorb. The mask is presentation-only on the interaction gate: the REAL
+    // streamed truth is recorded below (NoteStreamedGates) for the tripwire, and the verdict
+    // closes the pending -- after which the next packet restores host truth (denied) or keeps
+    // it false (accepted: the host's own hasSack dropped with the departure).
+    const bool takePending = coop::drone_take_sync::HasPendingTake();
+    const bool mirrorHasSack = coop::drone_take_sync::EffectiveMirrorHasSack(hasSack, takePending);
+
+    // Interaction gate: write canTakeOff (THE gate) + the EFFECTIVE hasSack (option prerequisite)
+    // onto the mirror so a parked drone is interactable instead of "in motion" (the suppressed
+    // tick never sets them).
+    D::WriteGateFields(drone, canTakeOff, mirrorHasSack);
+    coop::drone_take_sync::NoteStreamedGates(canTakeOff, hasSack);  // KROFNE FORK: the REAL host truth
+                                    // (the take lane's mirror-divergence tripwire reads this)
     if (hasSack)
         D::RepointContainer(drone);  // cargo aboard -> point the mirror at the prop-mirrored container.
                                      // EVERY hasSack packet (not just the rising edge): the container

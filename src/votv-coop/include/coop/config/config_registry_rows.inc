@@ -292,6 +292,9 @@ CFG_FLAG(force_kerfur_unmap, "force_kerfur_unmap", "dev", false, nullptr,
     "Test driver: force kerfur identity unmap paths.")
 CFG_FLAG(force_save_churn, "force_save_churn", "dev", false, nullptr,
     "Test driver: force save churn (identity stress).")
+CFG_FLAG(batch1_smoke, "batch1_smoke", "dev", false, nullptr,
+    "Batch-1 diagnostic smoke log: emit B1_* milestone lines (drone take / extraction birth / "
+    "sleep ownership) during normal play. Log-only -- no automation, no gameplay effect.")
 
 // THE TWO ATLAS DRILL KNOBS. ui/atlas_watch.cpp ships two silent-degradation
 // detectors, and a detector nobody has watched go RED is decoration

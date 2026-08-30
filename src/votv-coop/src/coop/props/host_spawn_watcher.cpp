@@ -1,5 +1,6 @@
 // coop/host_spawn_watcher.cpp -- see coop/host_spawn_watcher.h.
 
+#include "coop/dev/batch1_smoke.h"          // KROFNE FORK: B1_* diagnostic milestones (log-only)
 #include "coop/props/host_spawn_watcher.h"
 
 #include "coop/element/element.h"
@@ -17,6 +18,7 @@
 #include "ue_wrap/core/log.h"
 #include "ue_wrap/actors/prop.h"            // IsDescendantOfProp (the keyed-prop gate for the Q-menu seam)
 #include "ue_wrap/core/reflection.h"
+#include "ue_wrap/devices/drone.h"           // KROFNE FORK: IsDroneSack (the B1_DRONE_REAL_SACK milestone)
 #include "ue_wrap/core/sdk_profile.h"
 #include "ue_wrap/core/types.h"       // FTransform (the reflected SpawnTransform param layout)
 #include "ue_wrap/core/ufunction_hook.h"  // FinishSpawningActor Func patch (v106 keyed spawn seam)
@@ -394,6 +396,13 @@ void DrainPendingSpawns(coop::net::Session* s) {
         // periodic safety census.
         coop::prop_lifecycle::ExpressSpawnedProp(e.actor);
         if (PT::GetPropElementIdForActor(e.actor) != coop::element::kInvalidId) {
+            if (ue_wrap::drone::IsDroneSack(e.actor)) {
+                const std::wstring sackKey = ue_wrap::prop::GetInteractableKeyString(e.actor);
+                coop::dev::batch1_smoke::Emit("B1_DRONE_REAL_SACK", "actor=%p eid=%u key='%ls'",
+                                              e.actor,
+                                              static_cast<unsigned>(PT::GetPropElementIdForActor(e.actor)),
+                                              sackKey.c_str());
+            }
             UE_LOGI("host_spawn_watcher: spawn-seam adopted %p eid=%u (FinishSpawningActor "
                     "Func seam -- drop/place visible to peers this tick)",
                     e.actor,

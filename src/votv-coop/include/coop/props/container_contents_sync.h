@@ -89,6 +89,37 @@ void QueueConnectBroadcastForSlot(int peerSlot);
 
 void OnDisconnect();
 
+// HOST, one peer left (subsystems' per-slot fanout; v3 blocker L): drop THAT slot's pending
+// extraction pairing state (parked intents, applied markers, bounded birth retries). The slot's
+// next occupant is a NEW generation and starts a clean identity domain -- nothing of the leaver
+// can pair, commit, or answer into it.
+void OnDisconnectForSlot(int slot);
+
+// ---- KROFNE FORK (batch-1C): the extraction-birth causality query ------------------------------
+// True iff, on the CURRENT game thread, the innermost vm_dispatch verb is this module's takeObj
+// edge on a SYNCED WORLD container's inventory (client role, connected). prop_drop_intent's
+// FinishSpawningActor hook calls this DURING the verb body to flag a freshly-born Aprop_C as the
+// causal product of a client container extraction (the birth the b133 pipeline silently dropped).
+// Everything else -- addObject, personal inventory (BOUNDARY 1), untracked containers, other verbs
+// -- is false, so this is NOT a blanket client-birth allow. Game thread only.
+bool IsClientTakeObjExtractionActive();
+
+// ---- KROFNE FORK (corrective pass, blocker E): the extraction PAIRING API ---------------------
+// The host authors an extracted world birth ONLY after the paired contents mutation is Accepted
+// by the existing baseHash CAS. The correlation token is minted on the client INSIDE the takeObj
+// edge, rides the birth intent (ContainerExtractIntent) AND the client's next contents write for
+// the same eid (an op=1 blob tail), and pairs on the host regardless of arrival order.
+
+// The token minted at the CURRENT takeObj edge (0 = none). Called by prop_drop_intent's
+// FinishSpawningActor hook WHILE the bracket is live, to bind the birth to the token. GT only.
+void CurrentExtraction(uint64_t& outToken, uint32_t& outEid);
+
+// HOST: record a just-arrived ContainerExtractIntent. The intent is PARKED (or, if its write
+// already Applied, committed immediately); nothing spawns from the packet alone. The pairing
+// key binds (senderSlot, occupancy generation, token) -- v3 blocker L. Returns false for a
+// duplicate-committed or malformed intent.
+bool ParkExtractionBirth(const coop::net::ContainerExtractIntentPayload& p, uint8_t senderSlot);
+
 // ---- dev-instrument seams (coop/dev/container_selftest) --------------------------------------
 //
 // These exist so the instrument REUSES this module's measured world-vs-personal boundary instead

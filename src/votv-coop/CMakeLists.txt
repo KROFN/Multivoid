@@ -338,6 +338,7 @@ add_library(votv-coop SHARED
     src/coop/interactables/power_sync.cpp
     src/coop/interactables/atv_sync.cpp
     src/coop/interactables/drone_sync.cpp
+    src/coop/interactables/drone_take_sync.cpp
     src/coop/items/order_sync.cpp
     src/coop/world/firefly_sync.cpp
     src/coop/world/spawn_authority.cpp
@@ -381,6 +382,7 @@ add_library(votv-coop SHARED
     src/coop/props/save_identity_map.cpp
     src/coop/props/save_identity_bind.cpp
     src/coop/dev/force_overdestroy_test.cpp
+    src/coop/dev/batch1_smoke.cpp
     src/coop/props/prop_census.cpp
     src/coop/props/prop_element_tracker.cpp
     src/coop/props/prop_key_index.cpp
@@ -429,6 +431,7 @@ add_library(votv-coop SHARED
     src/coop/element/identity_create.cpp
     src/coop/element/identity_destroy.cpp
     src/ue_wrap/core/component_calls.cpp
+    src/coop/net/send_backlog.cpp   # KROFNE FORK v3 blocker N: retry backlog for the fork-critical sends
     src/coop/net/session.cpp
     src/coop/net/session_streams.cpp
     src/coop/net/net_stats.cpp

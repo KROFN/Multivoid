@@ -36,6 +36,7 @@
 #include <string>
 
 #include "coop/net/protocol.h"
+#include "coop/props/extract_pairing.h"   // BirthVerdict (the v3 blocker-M author outcome)
 
 namespace coop::net { class Session; }
 
@@ -57,8 +58,10 @@ void NoteClientKeyedDestroy(const std::wstring& key);
 
 // HOST handler for a received PropDropIntent: spawn the authoritative Aprop_C by Key at the transform
 // (the host's FinishSpawn watcher broadcasts it). Dup-guarded (skips if the host already has the Key
-// live). Game thread.
-void OnPropDropIntent(coop::net::Session& session, const coop::net::PropDropIntentPayload& p,
+// live). Returns TRUE when the authoritative prop EXISTS after the call -- spawned now, or the exact
+// key was already live (the dup-guard) -- FALSE only when the birth could not be established (v3
+// blocker M uses this to distinguish success from a transient failure).
+bool OnPropDropIntent(coop::net::Session& session, const coop::net::PropDropIntentPayload& p,
                       uint8_t senderSlot);
 
 // v114 (L7): HOST handler for ReliableKind::ReelEjectIntent -- a CLIENT's caddy/reelbox eject
@@ -69,6 +72,37 @@ void OnPropDropIntent(coop::net::Session& session, const coop::net::PropDropInte
 // Design: research/findings/computers-devices/votv-tape-caddy-L7-impl-DESIGN-2026-07-17.md.
 void OnReelEjectIntent(coop::net::Session& session, const coop::net::PropDropIntentPayload& p,
                        uint8_t senderSlot);
+
+// KROFNE FORK (batch-1C, REVISED by the corrective pass / blocker E): HOST handler for
+// ReliableKind::ContainerExtractIntent -- a CLIENT's native takeObj on a synced WORLD container
+// birthed an Aprop_C locally. ARRIVING AS THIS KIND IS NOT CAUSAL PROOF: the handler only
+// class-validates the payload and PARKS it (container_contents_sync::ParkExtractionBirth). The
+// birth is authored ONLY when the container mutation carrying the SAME extraction token returns
+// Applied from the existing baseHash CAS -- a refused (stale) mutation spawns NOTHING, so the
+// item cannot end up both in the host container and in the world.
+void OnContainerExtractIntent(coop::net::Session& session,
+                              const coop::net::ContainerExtractIntentPayload& p,
+                              uint8_t senderSlot);
+
+// KROFNE FORK (blocker E; REVISED v3 / blocker M): HOST-side commit, called by the pairing ledger
+// (coop::props::extract_pairing) when the paired contents mutation returned Applied. Runs the
+// SAME author as every other intent (dup-guard by key + HostSpawnPlacedProp), then the host
+// FinishSpawn watcher broadcasts the real PropSpawn and the extractor adopts its own local copy
+// by key. Returns the author OUTCOME so the ledger can reach a terminal state:
+//   Spawned          -- the host spawned the keyed actor (kOk is ordered by the ledger)
+//   AlreadyExists    -- the exact key already exists as the same authoritative birth (kOk)
+//   TransientFailure -- the birth could not be established (the ledger parks + retries bounded,
+//                       then answers kBirthFailed; the mutation was ALREADY accepted, so the item
+//                       is never silently lost)
+coop::props::extract_pairing::BirthVerdict SpawnExtractionBirth(
+    coop::net::Session& session, const coop::net::ContainerExtractIntentPayload& p,
+    uint8_t senderSlot);
+
+// KROFNE FORK (blocker E): CLIENT handler for ContainerExtractResult -- accept = terminal success,
+// the tracking entry is erased (the host's own PropSpawn adopts our local copy by key); ANY
+// accepted=0 (kRefused / kExpired / v3's kBirthFailed) = retire the local extracted ghost
+// (self-heal-safe: a prop_dronesack_C ghost gets takenByDrone set first).
+void OnContainerExtractResult(const coop::net::ContainerExtractResultPayload& p);
 
 // Session teardown -- clear the park set + pending. Game thread.
 void Reset();

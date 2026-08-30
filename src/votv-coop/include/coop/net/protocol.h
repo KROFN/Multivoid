@@ -705,7 +705,18 @@ inline constexpr uint32_t kMagic = 0x564D5450u;
 // + replays them in ConnectReplayForSlot. mainPlayer.holding_actor with an Aprop_C no
 // longer feeds the PropSpawn/PropPose path (the trash clump/pile carry -- the
 // non-Aprop_C holding_actor case -- stays on its lane untouched).
-inline constexpr uint16_t kProtocolVersion = 133; // v133 (2026-07-29, CHAT HISTORY -- +ChatLine=119 +ChatSpeaker=120, and ChatMessage=48 becomes client->host ONLY (out of IsClientRelayableReliableKind, RULE 2). Chat inverts from host-RELAYED to host-AUTHORED: the lobby now has a chat RECORD with a host-assigned lineSeq that IS the total order every peer sorts by, and a joiner is SEEDED from it. The relay could not carry this -- it fires on the NET thread at receive time, before the game thread where a lineSeq could be assigned even exists, so at relay time the order does not yet exist. A parse change AND a release, so the Paper-pair build number moves with it). Prior: v132 (2026-07-28, ARC B -- the HOST is the canonical namer: a Join's nick is ARBITRATED before it enters the ledger, and the assignment reaches the named peer on its own RosterRow (whose nick already sat in the FIXED PREFIX above the applyDeclared gate for exactly this). The row FORMAT is unchanged -- what changed is who authors the value and that the named peer KEEPS it: per the user's 2026-07-28 decision the assigned name is written back to multivoid.ini, so the next session asks to be called Pelmentor2 and keeps it unless someone else already is. The bump is the release rule + the Paper-pair build number, not a parse change). Prior: v131 (2026-07-28: RosterRow FIXED PREFIX widened -- +[u8 linkKind][i16 pingMs] after eid, so the HOST publishes how every player is connected to the SESSION and every board renders the same value for the same player. Retires the per-viewer derivation that answered transport on some rows and ROUTE ("VIA HOST") on others, in one column, side by side; retires the client-side rttMsForSlot fan-out to nameplates, which could only ever measure the host link. The fields sit in the FIXED PREFIX because the tail's offset arithmetic lives inside the applyDeclared block, which is skipped for exactly the host row and the receiver's own row). Prior: v130 (2026-07-27, arc A: PlayerJoined WIDENED + renamed RosterRow -- +uint16 playerNo, admits slot 0 and the receiver's own slot, playerNo 0 = slot empty. The roster ledger is now the single presence authority; a client's TAB used to list only itself and the host). Prior: v129 (2026-07-26, consume b128: DX12 overlay renderer + Graphics API indicator + Tidy-up fix + the release notes/install pipeline); v128 (consume b127, the WHOLE ini workstream -- arc 3 const Row& ratchet + arc 4 T8 catalog); v127 (consume b126, arcs 1+2); v126 (consume b125, drill-matrix, retracted); v125 (2026-07-22, R11b container extraction):
+// KROFNE FORK PROTOCOL (batch-1, 2026-08-28): this fork starts from b133 (stock 133) and adds
+// THREE fork-local reliable kinds (DroneActionRequest=121, DroneActionResult=122,
+// ContainerExtractIntent=123). Fork-local version identifier: **2133** = "fork of 133, batch 1".
+// Why this value is safe: upstream numbers its protocol sequentially (133 at b133, 134..143 on
+// current main) -- the 2xxx band cannot collide with any upstream 1xx value, is a parse change
+// (ParseHeader rejects `h.version != kProtocolVersion`, so a stock-b133 peer FAILS the handshake
+// cleanly instead of mis-parsing fork wire shapes), and is uint16-stable. The build number parsed
+// out of this constant also renames the payload DLL (multivoid-0.9.0n-2133.dll), so a fork build
+// can never be confused with a stock one by the xinput proxy's highest-build scan.
+// Compatibility matrix: stock b133 <-> fork = INTENTIONALLY INCOMPATIBLE (clean reject at
+// ParseHeader); fork <-> fork = compatible; game build stays Alpha 0.9.0n.
+inline constexpr uint16_t kProtocolVersion = 2133; // fork of v133 (2026-07-29, CHAT HISTORY -- +ChatLine=119 +ChatSpeaker=120, and ChatMessage=48 becomes client->host ONLY (out of IsClientRelayableReliableKind, RULE 2). Chat inverts from host-RELAYED to host-AUTHORED: the lobby now has a chat RECORD with a host-assigned lineSeq that IS the total order every peer sorts by, and a joiner is SEEDED from it. The relay could not carry this -- it fires on the NET thread at receive time, before the game thread where a lineSeq could be assigned even exists, so at relay time the order does not yet exist. A parse change AND a release, so the Paper-pair build number moves with it). Prior: v132 (2026-07-28, ARC B -- the HOST is the canonical namer: a Join's nick is ARBITRATED before it enters the ledger, and the assignment reaches the named peer on its own RosterRow (whose nick already sat in the FIXED PREFIX above the applyDeclared gate for exactly this). The row FORMAT is unchanged -- what changed is who authors the value and that the named peer KEEPS it: per the user's 2026-07-28 decision the assigned name is written back to multivoid.ini, so the next session asks to be called Pelmentor2 and keeps it unless someone else already is. The bump is the release rule + the Paper-pair build number, not a parse change). Prior: v131 (2026-07-28: RosterRow FIXED PREFIX widened -- +[u8 linkKind][i16 pingMs] after eid, so the HOST publishes how every player is connected to the SESSION and every board renders the same value for the same player. Retires the per-viewer derivation that answered transport on some rows and ROUTE ("VIA HOST") on others, in one column, side by side; retires the client-side rttMsForSlot fan-out to nameplates, which could only ever measure the host link. The fields sit in the FIXED PREFIX because the tail's offset arithmetic lives inside the applyDeclared block, which is skipped for exactly the host row and the receiver's own row). Prior: v130 (2026-07-27, arc A: PlayerJoined WIDENED + renamed RosterRow -- +uint16 playerNo, admits slot 0 and the receiver's own slot, playerNo 0 = slot empty. The roster ledger is now the single presence authority; a client's TAB used to list only itself and the host). Prior: v129 (2026-07-26, consume b128: DX12 overlay renderer + Graphics API indicator + Tidy-up fix + the release notes/install pipeline); v128 (consume b127, the WHOLE ini workstream -- arc 3 const Row& ratchet + arc 4 T8 catalog); v127 (consume b126, arcs 1+2); v126 (consume b125, drill-matrix, retracted); v125 (2026-07-22, R11b container extraction):
                                                   // ContainerContents becomes BIDIRECTIONAL and its
                                                   // blob gains a baseHash. A client now AUTHORS the
                                                   // world container it mutated (presser-authored
@@ -2669,6 +2680,60 @@ enum class ReliableKind : uint8_t {
     // protocol version (peer with older protocol may still send them; the
     // current server-side dispatch ignores unknown ReliableKind values, so
     // forward-compat is intact, but future use should pick fresh IDs).
+
+    // ---- KROFNE FORK kinds (batch-1, protocol 2133; see the kProtocolVersion note) ----
+    // The stock b133 drone mirror streams pose + the canTakeOff/hasSack GATE fields host->client
+    // (DroneState=38), which makes the client's PARKED mirror drone fully interactable -- but no
+    // client->host lane exists for the ONE verb those options exist to run (the cargo take,
+    // Adrone_C::dropSack). The client's take therefore runs client-locally: it spawns a
+    // local ghost sack and flips LOCAL hasSack, and the next DroneState packet (<=50 ms) re-asserts
+    // host truth -- the host-authoritative departure transition never executes (drone never leaves;
+    // the take option re-arms forever = the infinite-sack duplicate). DroneActionRequest/Result are
+    // the missing causal lane: the client OBSERVES its native dropSack dispatch (the 0x45 verb,
+    // ctx-gated to the EXACT drone class -- NOT the multiplexing actionOptionIndex, whose argument
+    // values the vm_dispatch Bracket does not carry), forwards a single-operation INTENT, the HOST
+    // validates ITS OWN drone state and dispatches the drone's OWN native verb, and the normal
+    // host replication distributes the result. The forward-and-reconcile pattern (donor: main's
+    // v139 CoinCollect; ported, no upstream wire).
+    //
+    // SEAM STATUS (v3 review, 2026-08-28): VERIFIED for VotV 0.9.0n b133. The RE corpus records
+    // Adrone_C::dropSack as EX_LocalVirtualFunction / opcode 0x45 for THIS build -- the seam this
+    // lane observes is proven, not presumed. The mirror-divergence tripwire (drone_take_sync)
+    // remains wired as a DIAGNOSTIC (it would catch a future cook finalizing the verb onto the
+    // 0x46 path), but dropSack visibility is NOT an open question for this target and must not
+    // be listed as unresolved anywhere.
+    DroneActionRequest = 121, // KROFNE FORK: CLIENT->HOST -- "my player just ran the native
+                              //     dropSack locally; perform it natively on yours". Payload:
+                              //     DroneActionRequestPayload (8 B). HOST-TERMINAL (never
+                              //     relayed; a client's take is its own intent, other clients
+                              //     learn the OUTCOME through the host's DroneState stream + the
+                              //     real sack's PropSpawn).
+    DroneActionResult = 122,  // KROFNE FORK: HOST->ONE CLIENT -- the verdict for a
+                              //     DroneActionRequest nonce. Payload:
+                              //     DroneActionResultPayload (8 B). The client retires its local
+                              //     phantom either way (accept = the host's real sack arrives as
+                              //     an ordinary PropSpawn; deny = host state stands).
+    ContainerExtractIntent = 123, // KROFNE FORK: CLIENT->HOST -- "my native takeObj on a synced
+                              //     WORLD container just birthed this Aprop_C locally; AUTHOR IT
+                              //     ONLY IF the paired contents mutation is accepted". Payload:
+                              //     ContainerExtractIntentPayload (188 B = the 172 B
+                              //     PropDropIntent birth metadata + a u64 extraction token + the
+                              //     u32 source container eid). The b133 client birth pipeline
+                              //     drops extractor births on the floor (prop_drop_intent drain,
+                              //     non-parked non-whitelisted), so the item existed only on the
+                              //     extracting peer (ghost / wall-origin / loss). ARRIVING AS THIS
+                              //     KIND IS NOT CAUSAL PROOF: the intent is PARKED and spawns only
+                              //     when the container mutation carrying the SAME token returns
+                              //     Applied from the existing baseHash CAS (blocker E -- otherwise a
+                              //     refused stale write would duplicate the item: world prop + item
+                              //     still in the container). HOST-TERMINAL.
+    ContainerExtractResult = 124, // KROFNE FORK: HOST->ONE CLIENT -- the verdict for an extraction
+                              //     pairing: token + accepted. On REJECT the client retires its
+                              //     local extracted ghost (the host refused the paired mutation;
+                              //     its re-published container truth still holds the item). On a
+                              //     parked-birth EXPIRY (the paired write never came) the host also
+                              //     answers reject. Payload: ContainerExtractResultPayload (16 B).
+                              //     HOST-TERMINAL.
 };
 
 #pragma pack(push, 1)
@@ -3378,6 +3443,96 @@ struct PropDropIntentPayload {
 };
 static_assert(sizeof(PropDropIntentPayload) == 172, "PropDropIntentPayload must be 172 bytes (v114: +savedScalar)");
 static_assert(sizeof(PropDropIntentPayload) <= 256 - 20 - 8, "PropDropIntentPayload must fit one datagram");
+
+// ---- KROFNE FORK payloads (protocol 2133) ---------------------------------------
+//
+// Corrective-pass note (post-review, 2026-08-28): the fork wire was REVISED before any release
+// existed (the 2f32d1af..f0b45e23 commits never shipped; CI never ran). Protocol stays 2133 --
+// the identity's job is peer compatibility, and every peer that can connect runs exactly this
+// revised layout.
+
+// The fork operation enum for DroneActionRequest. The request names ONE operation --
+// "run your native dropSack" -- it does NOT echo an observed actionOptionIndex argument:
+// the vm_dispatch Bracket carries the Context but NO argument values (vm_dispatch.h),
+// and Adrone_C::actionOptionIndex multiplexes several options (RE: action 4 ->
+// openPropInv(container), action 7 -> dropSack()), so an option index was never
+// authorable from the observation seam. The client instead observes the CAUSAL verb
+// itself (the 0x45 dropSack dispatch, ctx-gated to the exact drone class) and asks the
+// host to perform the same single operation. The host accepts ONLY kDroneOpDropSack, so
+// an unknown op fails closed (loud deny, no dispatch).
+namespace drone_action_op {
+inline constexpr uint8_t kNone     = 0;  // never valid on the wire (zero-filled default)
+inline constexpr uint8_t kDropSack = 1;  // "perform your native dropSack" (the cargo take)
+}  // namespace drone_action_op
+
+// DroneActionRequest (121): CLIENT->HOST, 8 B. nonce is the client's per-session monotonic request
+// id -- the host keeps a per-slot replay domain (see coop/drone_take_sync.h), so a
+// replayed/retransmitted request cannot execute the native take twice, a denied nonce cannot
+// become executable later, and a rejoining client on a reused slot starts a fresh domain.
+struct DroneActionRequestPayload {
+    uint32_t nonce;                       // client-local monotonic per session (starts at 1)
+    uint8_t  op;                          // drone_action_op::*; host accepts only kDropSack
+    uint8_t  _pad[3] = {};                // 4-byte alignment; zero on the wire
+};
+static_assert(sizeof(DroneActionRequestPayload) == 8, "DroneActionRequestPayload must be 8 bytes");
+
+// DroneActionResult reason codes (fork-local; the deny taxonomy).
+namespace drone_action_result {
+inline constexpr uint8_t kOk          = 0;  // accepted + native dispatch issued
+inline constexpr uint8_t kNotArrived  = 1;  // host canTakeOff false (drone not parked-with-cargo)
+inline constexpr uint8_t kNoCargo     = 2;  // host hasSack false (nothing aboard)
+inline constexpr uint8_t kBadOp       = 3;  // op != drone_action_op::kDropSack
+inline constexpr uint8_t kReplay      = 4;  // nonce refused by the per-slot replay domain
+inline constexpr uint8_t kDroneGone   = 5;  // the host drone did not resolve / is not live
+inline constexpr uint8_t kDispatch    = 6;  // the native verb resolve/dispatch failed
+}  // namespace drone_action_result
+
+// DroneActionResult (122): HOST->ONE CLIENT, 8 B.
+struct DroneActionResultPayload {
+    uint32_t nonce;                       // echoes the request's nonce
+    uint8_t  accepted;                    // 1 = host performed the native take; 0 = denied
+    uint8_t  reason;                      // drone_action_result::*
+    uint8_t  _pad[2] = {};
+};
+static_assert(sizeof(DroneActionResultPayload) == 8, "DroneActionResultPayload must be 8 bytes");
+
+// ContainerExtractIntent (123): CLIENT->HOST, 188 B. The birth metadata of ONE client
+// container-extraction birth + the correlation that authorizes it (blocker E): `extractToken`
+// is minted on the client INSIDE the takeObj 0x45 edge and rides BOTH this intent AND the
+// client's next ContainerContents write for `containerEid` (a fork-local op=1 blob tail). The
+// host spawns the birth ONLY when that exact mutation returns Applied from the existing CAS --
+// never from the intent alone.
+struct ContainerExtractIntentPayload {
+    PropDropIntentPayload birth;          // 172 -- full birth metadata (class/key/name/transform/scale/physFlags/savedScalar)
+    uint64_t extractToken;                // 8  -- correlation token (never 0 on the wire)
+    uint32_t containerEid;                // 4  -- the source container's stable eid
+    uint8_t  _pad[4] = {};                // 4  -- zero on the wire
+};
+static_assert(sizeof(ContainerExtractIntentPayload) == 188, "ContainerExtractIntentPayload must be 188 bytes");
+static_assert(sizeof(ContainerExtractIntentPayload) <= 256 - 20 - 8, "ContainerExtractIntentPayload must fit one datagram");
+
+// Extraction-pairing reject taxonomy (fork-local).
+namespace container_extract_result {
+inline constexpr uint8_t kOk       = 0;  // the paired mutation was Applied; the host authored the birth
+inline constexpr uint8_t kRefused  = 1;  // the paired contents write was REFUSED by the host CAS
+inline constexpr uint8_t kExpired  = 2;  // the parked intent's pairing window lapsed (write never came)
+// v3 (blocker M): the bounded post-accept birth recovery lapsed -- the paired mutation was
+// ACCEPTED (the item left the host container) but the authoritative world birth could not be
+// established within the retry window. The honest terminal state: the item is now in NEITHER
+// place, and every peer is told so (the client retires its local ghost on any accepted=0).
+inline constexpr uint8_t kBirthFailed = 3;
+}
+
+// ContainerExtractResult (124): HOST->ONE CLIENT, 16 B. On accept the extractor's local copy is
+// adopted by the host's own PropSpawn (the ordinary converge); on reject the client retires its
+// local ghost (the host's re-published container truth still holds the item).
+struct ContainerExtractResultPayload {
+    uint64_t extractToken;                // 8 -- echoes the intent's token
+    uint8_t  accepted;                    // 1 = paired mutation Applied + birth authored
+    uint8_t  reason;                      // container_extract_result::*
+    uint8_t  _pad[6] = {};                // 6 -- zero on the wire
+};
+static_assert(sizeof(ContainerExtractResultPayload) == 16, "ContainerExtractResultPayload must be 16 bytes");
 
 // --- v56 save-transfer join bootstrap ------------------------------------------
 // Chunk DATA bytes per SaveTransferChunk message (+4 B index prefix). Far above

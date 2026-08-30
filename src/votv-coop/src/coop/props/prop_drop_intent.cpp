@@ -4,10 +4,15 @@
 
 #include "coop/element/registry.h"          // EidForActor (drain: tracked/mirror exclusion)
 #include "coop/net/protocol.h"
+#include "coop/net/send_backlog.h"          // KROFNE FORK v3 (blocker N): critical-send retries
 #include "coop/net/session.h"
 #include "coop/player/hand_item.h"          // LocalHandActor (place detect: exclude the hand display)
+#include "coop/props/container_contents_sync.h"  // KROFNE FORK: extraction causality + pairing
 #include "coop/props/prop_echo_suppress.h"  // PeekIncomingSpawn (exclude host-echo adopt spawns)
+#include "coop/dev/batch1_smoke.h"          // KROFNE FORK: B1_* diagnostic milestones (log-only)
 #include "coop/props/prop_element_tracker.h"// GetPropElementIdForActor, ResolveLiveActorByKey
+#include "coop/props/prop_lifecycle.h"     // KROFNE FORK: DestroyLocalProp (extract-ghost retire)
+#include "ue_wrap/devices/drone.h"          // KROFNE FORK: IsDroneSack/SetSackTakenByDrone (self-heal-safe retire)
 #include "coop/session/world_load_episode.h"  // InEpisode (quiet during the join loadObjects churn)
 #include "ue_wrap/core/call.h"                   // ParamFrame + Call (setKey on the host re-spawn)
 #include "ue_wrap/engine/engine.h"                 // BeginDeferredSpawn/FinishDeferredSpawn/SetActorScale3D
@@ -30,9 +35,12 @@
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <string>
 #include <unordered_set>
 #include <vector>
+
+#include <chrono>
 
 namespace coop::prop_drop_intent {
 namespace {
@@ -54,9 +62,31 @@ struct PendingPlace {
     void*   actor = nullptr;
     int32_t idx   = -1;
     int     tries = 0;   // net-pump ticks waited for the loadData Key restore
+    // KROFNE FORK (batch-1C, corrective E): nonzero iff the spawn was causally flagged by the LIVE
+    // takeObj 0x45 bracket (container_contents_sync::IsClientTakeObjExtractionActive, queried at
+    // FinishSpawn time while the verb body is still dispatching). Recorded at ENQUEUE because the
+    // bracket has unwound by drain time. The token+eid pair is what authorizes the birth host-side
+    // -- the intent alone is not causal proof (blocker E: the paired contents mutation must be
+    // Applied first). Zero = every other birth/place kind, original semantics.
+    uint64_t extractToken = 0;
+    uint32_t extractEid   = 0;
 };
 std::vector<PendingPlace> g_pending;         // GT-only
 constexpr size_t kMaxPending  = 32;          // runaway backstop (a settled client rarely has >1 in flight)
+
+// KROFNE FORK (blocker E): client-side ghosts we authored an extract intent for, awaiting the
+// host's verdict. Accept -> the host's own PropSpawn adopts the local copy by key (nothing to
+// do); ANY accepted=0 verdict (kRefused / kExpired / v3's kBirthFailed) -> retire the ghost.
+// v3 (blocker M): the verdicts all ride the send backlog now, and the ghost TTL below is
+// ENFORCED in Tick -- a verdict that is genuinely lost (host gone, backlog expiry) can no
+// longer leave a permanent unbacked local actor. Cleared on disconnect.
+struct ExtractGhost {
+    void*    actor = nullptr;
+    int32_t  idx = -1;
+    uint64_t sentMs = 0;
+};
+std::map<uint64_t, ExtractGhost> g_extractGhosts;   // token -> local actor
+constexpr uint64_t kExtractGhostTtlMs = 15000;
 constexpr int    kMaxKeyTries = 8;           // ~8 net-pump ticks (~64 ms) for the Key to restore, then give up
 
 // ---- park set: keys the CLIENT locally destroyed (pickup) and may re-place --
@@ -114,11 +144,26 @@ void OnClientFinishSpawn(void* /*context*/, void* /*srcObj*/, void* result) {
     // check; the DRAIN-time re-check in Tick() is the authoritative one, the proven host_spawn_watcher
     // shape. Audit 2026-07-10 CRITICAL.). IsHandAxisActor also covers remote display mirrors.
     if (coop::hand_item::IsHandAxisActor(actor)) return;
+    // KROFNE FORK (batch-1C): record the extraction causality NOW -- FinishSpawningActor fires
+    // INSIDE the native takeObj verb body, and vm_dispatch publishes CurrentThreadVerb() exactly
+    // for such downstream seams. Everything else about this entry is unchanged.
+    const bool fromExtract = coop::props::container_contents_sync::IsClientTakeObjExtractionActive();
+    uint64_t extractToken = 0;
+    uint32_t extractEid = 0;
+    if (fromExtract) {
+        // Corrective pass (blocker E): bind the birth to its correlation token, minted at the
+        // takeObj edge. The host spawns ONLY when the paired mutation is Applied.
+        coop::props::container_contents_sync::CurrentExtraction(extractToken, extractEid);
+    }
     if (g_pending.size() >= kMaxPending) {
         UE_LOGW("[PROP-DROP] client pending-place cap %zu hit -- dropping %p", kMaxPending, actor);
         return;
     }
-    g_pending.push_back(PendingPlace{actor, R::InternalIndexOf(actor), 0});
+    g_pending.push_back(PendingPlace{actor, R::InternalIndexOf(actor), 0, extractToken, extractEid});
+    if (fromExtract)
+        UE_LOGI("[PROP-DROP] CLIENT extraction birth flagged: actor=%p cls='%ls' token=%llu eid=%u "
+                "(takeObj bracket live)", actor, R::ClassNameOf(actor).c_str(),
+                static_cast<unsigned long long>(extractToken), extractEid);
 }
 
 // HOST: spawn the authoritative Aprop by Key at the transform. Mirrors remote_prop_spawn's
@@ -229,8 +274,50 @@ void Install(coop::net::Session* session) {
     g_installed = true;
 }
 
+// KROFNE FORK (corrective E): the self-heal-safe local-ghost retire, shared by the extraction
+// reject path AND the v3 ghost-TTL sweep in Tick (which runs earlier in this TU, hence this
+// definition lives before it). A prop_dronesack_C ghost MUST get takenByDrone=true before the
+// destroy-suppressed retire (native ReceiveDestroyed otherwise spawns a replacement at the
+// drone -- the cleanup would mint the next phantom). Any other Aprop_C class retires directly.
+// Fail-closed: an unproven actor is left alive with a WARN.
+static void RetireLocalGhost(void* actor, int32_t idx, const char* why) {
+    if (!actor || !R::IsLiveByIndex(actor, idx)) return;
+    if (ue_wrap::drone::IsDroneSack(actor)) {
+        if (!ue_wrap::drone::SetSackTakenByDrone(actor)) {
+            UE_LOGW("[PROP-DROP] ghost %p is a drone sack but takenByDrone could not be set -- "
+                    "REFUSING to destroy (a destroy would self-heal another sack)", actor);
+            return;
+        }
+    }
+    coop::prop_lifecycle::DestroyLocalProp(actor, /*deferred=*/false);
+    UE_LOGI("[PROP-DROP] retired local ghost %p (%s)", actor, why);
+}
+
 void Tick(coop::net::Session* session) {
     UE_ASSERT_GAME_THREAD("prop_drop_intent::Tick");
+    // v3 (blocker M): the ghost TTL is ENFORCED. Every tracked extraction ghost now reaches a
+    // terminal state -- the pairing ledger answers kOk / kRefused / kExpired / kBirthFailed and
+    // each verdict rides the send backlog -- but a verdict can STILL be genuinely lost (host
+    // gone mid-session, backlog expiry). A ghost that outlives kExtractGhostTtlMs without a
+    // verdict is retired (self-heal-safe) and logged loudly: never a permanent unbacked local
+    // actor. Runs BEFORE the pending drain's early return; only clients ever hold ghosts.
+    if (!g_extractGhosts.empty()) {
+        const uint64_t nowMs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        for (auto it = g_extractGhosts.begin(); it != g_extractGhosts.end();) {
+            const uint64_t token = it->first;
+            const ExtractGhost g = it->second;
+            if (nowMs - g.sentMs <= kExtractGhostTtlMs) { ++it; continue; }
+            it = g_extractGhosts.erase(it);
+            RetireLocalGhost(g.actor, g.idx, "extract ghost TTL (no verdict arrived)");
+            UE_LOGW("[PROP-DROP] CLIENT extract ghost token=%llu outlived its %llums TTL with no "
+                    "verdict -- retired (unbacked local actor; if the item went missing the "
+                    "intent/result lanes lost it -- REPORT this log)",
+                    static_cast<unsigned long long>(token),
+                    static_cast<unsigned long long>(kExtractGhostTtlMs));
+        }
+    }
     if (g_pending.empty()) return;
     if (!session || !session->connected() || session->role() != coop::net::Role::Client) {
         g_pending.clear();
@@ -275,8 +362,38 @@ void Tick(coop::net::Session* session) {
               ue_wrap::phys_mods::IsModuleClass(R::ClassOf(e.actor))) ||
              (ue_wrap::drive_chain::EnsureResolved() &&
               ue_wrap::drive_chain::IsDriveClass(R::ClassOf(e.actor))));
-        if (!parked && !freshBirth) continue;  // not a place of a picked-up prop, not a whitelisted birth
-        // Author the host-authoritative spawn intent (place OR reel-eject birth).
+        // KROFNE FORK (batch-1C, corrective E): the EXTRACTION birth -- causally flagged at
+        // ENQUEUE by the live takeObj 0x45 bracket on a synced world container AND bound to its
+        // correlation token. This is the third (and only causality-gated) birth door; parked
+        // places and reel/module/drive whitelist births keep their exact original semantics.
+        const bool extractBirth = e.extractToken != 0 && e.extractEid != 0 && !parked;
+        if (!parked && !freshBirth && !extractBirth) {
+            // KROFNE FORK (C3): the b133 gate here was a SILENT continue -- a client birth that
+            // was neither a parked place nor a whitelisted birth just vanished from the wire with
+            // no trace (the exact reason the extraction hole stayed invisible for weeks).
+            // Rate-limited diagnostic (one line / 5 s + a running count): class, prop name, key,
+            // and the extraction-window state at enqueue, so an unexpected dropped birth is
+            // diagnosable from the log alone.
+            static uint64_t s_lastWarnMs = 0;
+            static uint64_t s_suppressed = 0;
+            const uint64_t nowMs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+            ++s_suppressed;
+            if (nowMs - s_lastWarnMs >= 5000) {
+                s_lastWarnMs = nowMs;
+                const std::wstring wcls = R::ClassNameOf(e.actor);
+                const std::wstring wnm = ue_wrap::prop::GetPropNameString(e.actor);
+                UE_LOGW("[PROP-DROP] CLIENT birth dropped (not parked / not whitelisted / not an "
+                        "extraction) cls='%ls' name='%ls' key-not-restored-yet=%d extractFlag=%d "
+                        "-- %llu dropped since last line", wcls.c_str(), wnm.c_str(),
+                        (key.empty() || key == L"None") ? 1 : 0, e.extractToken ? 1 : 0,
+                        static_cast<unsigned long long>(s_suppressed));
+                s_suppressed = 0;
+            }
+            continue;
+        }
+        // Author the host-authoritative spawn intent (place OR whitelisted birth OR extraction birth).
         coop::net::PropDropIntentPayload p{};
         const std::wstring cls = R::ClassNameOf(e.actor);
         FillWireStr(p.className.len, p.className.data, cls);
@@ -310,6 +427,16 @@ void Tick(coop::net::Session* session) {
             if (ue_wrap::drive_chain::IsDriveClass(R::ClassOf(e.actor)))
                 coop::drive_sync::NoteLocalDriveBirth(e.actor);
         }
+        if (extractBirth) {
+            // KROFNE FORK: a drive (or any payload-bearing class) extracted from a container gets
+            // the same adoption note -- its data rides drive_sync's broadcast-at-adoption. The
+            // check is class-conditional, so this is a no-op for every other class.
+            if (ue_wrap::drive_chain::IsDriveClass(R::ClassOf(e.actor)))
+                coop::drive_sync::NoteLocalDriveBirth(e.actor);
+            // NO forced kSleep: an extraction drop is a WORLD birth -- the host copy gets the
+            // extractor's live physics state (the same parity an ordinary host-side PropSpawn
+            // carries), not the held-prop born-asleep convention.
+        }
         const auto loc = ue_wrap::engine::GetActorLocation(e.actor);
         const auto rot = ue_wrap::engine::GetActorRotation(e.actor);
         const auto scl = ue_wrap::engine::GetActorScale3D(e.actor);
@@ -318,12 +445,32 @@ void Tick(coop::net::Session* session) {
         p.rotYaw   = ue_wrap::NormalizeAxis(rot.Yaw);
         p.rotRoll  = ue_wrap::NormalizeAxis(rot.Roll);
         p.scaleX = scl.X; p.scaleY = scl.Y; p.scaleZ = scl.Z;
-        session->SendReliable(freshBirth ? coop::net::ReliableKind::ReelEjectIntent
-                                         : coop::net::ReliableKind::PropDropIntent,
-                              &p, sizeof(p));
+        const auto kind = extractBirth ? coop::net::ReliableKind::ContainerExtractIntent
+                        : freshBirth   ? coop::net::ReliableKind::ReelEjectIntent
+                                       : coop::net::ReliableKind::PropDropIntent;
+        if (extractBirth) {
+            // KROFNE FORK (corrective E; v3 blocker N): the intent carries the correlation token
+            // + source eid; the host PARKS it and authors the birth only when the paired contents
+            // mutation (the write that carries the same token) is Applied. SendCritical RETRIES
+            // the exact intent bytes until the transport queues them -- a refused send can no
+            // longer silently lose the intent while its contents write later applies (the
+            // authoritative item-loss sequence blocker N names). Register the local ghost so any
+            // reject/expiry/TTL can retire it.
+            coop::net::ContainerExtractIntentPayload ep{};
+            ep.birth        = p;
+            ep.extractToken = e.extractToken;
+            ep.containerEid = e.extractEid;
+            coop::net::send_backlog::SendCritical(*session, kind, -1, &ep, sizeof(ep));
+            g_extractGhosts[e.extractToken] = ExtractGhost{
+                e.actor, e.idx,
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count())};
+        } else {
+            session->SendReliable(kind, &p, sizeof(p));
+        }
         if (parked) UnparkKey(key);   // consume from BOTH the set AND the FIFO (mirror invariant)
         UE_LOGI("[PROP-DROP] CLIENT authored %s key='%ls' cls='%ls' name='%ls' loc=(%.1f,%.1f,%.1f)%s",
-                freshBirth ? "FRESH-BIRTH intent" : "drop intent",
+                extractBirth ? "EXTRACTION-BIRTH intent" : freshBirth ? "FRESH-BIRTH intent" : "drop intent",
                 key.c_str(), cls.c_str(),
                 WireToWide(p.propName.len, p.propName.data, sizeof(p.propName.data)).c_str(),
                 p.locX, p.locY, p.locZ,
@@ -344,28 +491,38 @@ void NoteClientKeyedDestroy(const std::wstring& key) {
     }
 }
 
-void OnPropDropIntent(coop::net::Session& session, const coop::net::PropDropIntentPayload& p,
+// v3 (blocker M): returns TRUE when the authoritative prop EXISTS after the call -- spawned
+// now, or the exact key was already live (the dup-guard IS the birth-exists proof). FALSE only
+// when a birth was due and could not be established (the extraction ledger treats that as a
+// transient failure and retries it, bounded).
+bool OnPropDropIntent(coop::net::Session& session, const coop::net::PropDropIntentPayload& p,
                       uint8_t senderSlot) {
     UE_ASSERT_GAME_THREAD("prop_drop_intent::OnPropDropIntent");
-    if (session.role() != coop::net::Role::Host) return;   // host-authoritative (router also gates)
+    if (session.role() != coop::net::Role::Host) return false;   // host-authoritative (router also gates)
     const std::wstring cls = WireToWide(p.className.len, p.className.data, sizeof(p.className.data));
     const std::wstring key = WireToWide(p.key.len, p.key.data, sizeof(p.key.data));
     if (key.empty() || key == L"None" || cls.empty()) {
         UE_LOGW("[PROP-DROP] HOST drop intent from slot=%u missing key/class -- dropping", senderSlot);
-        return;
+        return false;
     }
     // Dup guard: if the host somehow still has this Key live (the grab-destroy didn't cross), do NOT
     // spawn a second one. The park-set invariant normally guarantees the host has no copy here.
+    // v3: for the EXTRACTION ledger this outcome is SUCCESS -- the exact key already exists as
+    // the same authoritative birth (exactly-once; a retransmitted intent/dup write finds it).
     if (coop::prop_element_tracker::ResolveLiveActorByKey(key, nullptr)) {
         UE_LOGW("[PROP-DROP] HOST already has key='%ls' live -- skip drop-intent re-spawn (no dup)", key.c_str());
-        return;
+        return true;
     }
     void* actor = HostSpawnPlacedProp(p, cls, key);
     if (actor) {
         UE_LOGI("[PROP-DROP] HOST spawned client-placed prop key='%ls' cls='%ls' slot=%u at (%.1f,%.1f,%.1f) "
                 "-- FinishSpawn watcher broadcasts it this tick",
                 key.c_str(), cls.c_str(), senderSlot, p.locX, p.locY, p.locZ);
+        return true;
     }
+    UE_LOGW("[PROP-DROP] HOST spawn FAILED for key='%ls' cls='%ls' slot=%u -- the authoritative "
+            "birth could not be established this attempt", key.c_str(), cls.c_str(), senderSlot);
+    return false;
 }
 
 void OnReelEjectIntent(coop::net::Session& session, const coop::net::PropDropIntentPayload& p,
@@ -396,11 +553,142 @@ void OnReelEjectIntent(coop::net::Session& session, const coop::net::PropDropInt
     OnPropDropIntent(session, p, senderSlot);  // same author: dup-guard + HostSpawnPlacedProp
 }
 
+// KROFNE FORK (batch-1C, corrective E): the HOST handler for ContainerExtractIntent. The packet
+// carries birth metadata + a correlation token + the source container eid. ARRIVING AS THIS KIND
+// IS NOT CAUSAL PROOF and NEVER spawns anything by itself: the host's gate here is only the
+// CLASS check (the payload must name an Aprop_C descendant -- the only thing HostSpawnPlacedProp
+// knows how to author); the birth is authored by SpawnExtractionBirth when the paired contents
+// mutation carrying the SAME token returns Applied from the existing CAS (see
+// container_contents_sync::ParkExtractionBirth). A refused stale mutation spawns NOTHING -- that
+// is what closes the duplication race.
+void OnContainerExtractIntent(coop::net::Session& session,
+                              const coop::net::ContainerExtractIntentPayload& p,
+                              uint8_t senderSlot) {
+    UE_ASSERT_GAME_THREAD("prop_drop_intent::OnContainerExtractIntent");
+    if (session.role() != coop::net::Role::Host) return;   // host-authoritative (router also gates)
+    const std::wstring cls = WireToWide(p.birth.className.len, p.birth.className.data,
+                                        sizeof(p.birth.className.data));
+    void* clsObj = cls.empty() ? nullptr : R::FindClass(cls.c_str());
+    void* propBase = clsObj ? R::FindClass(P::name::PropClass) : nullptr;
+    if (!clsObj || !propBase || !ue_wrap::prop::WalksToBase(clsObj, propBase)) {
+        UE_LOGW("[PROP-DROP] HOST extract intent from slot=%u rejected: class '%ls' is not an "
+                "Aprop_C descendant", senderSlot, cls.c_str());
+        return;
+    }
+    if (p.extractToken == 0) {
+        UE_LOGW("[PROP-DROP] HOST extract intent from slot=%u rejected: zero token", senderSlot);
+        return;
+    }
+    // Park (or commit immediately if the write already Applied). Exactly-once + slot/eid
+    // matching live inside the pairing state.
+    coop::props::container_contents_sync::ParkExtractionBirth(p, senderSlot);
+}
+
+// KROFNE FORK (blocker E; REVISED v3 / blocker M): the once-only author, called by the pairing
+// ledger (extract_pairing.h) when the paired mutation returned Applied -- or by the ledger's
+// bounded birth-retry pump for a birth that transiently failed. Returns the author OUTCOME so
+// the ledger can reach a terminal state (Spawned / AlreadyExists = success, kOk ordered;
+// TransientFailure = parked for the bounded retry, kBirthFailed if the window lapses).
+coop::props::extract_pairing::BirthVerdict SpawnExtractionBirth(
+    coop::net::Session& session, const coop::net::ContainerExtractIntentPayload& p,
+    uint8_t senderSlot) {
+    UE_ASSERT_GAME_THREAD("prop_drop_intent::SpawnExtractionBirth");
+    (void)session;   // the hardened author spawns directly (OnPropDropIntent's dup-guard ran above)
+    const coop::net::PropDropIntentPayload& birth = p.birth;
+    const std::wstring key = WireToWide(birth.key.len, birth.key.data, sizeof(birth.key.data));
+    const std::wstring cls = WireToWide(birth.className.len, birth.className.data,
+                                        sizeof(birth.className.data));
+    // The exact key ALREADY being live is the AlreadyExists terminal state -- the same
+    // authoritative birth exists (e.g. a duplicate intent after a successful commit whose
+    // exactly-once memory has since been evicted). Probe it BEFORE spawning; resolution BY KEY
+    // is the proof (both are success verdicts over a PROVEN key).
+    if (!key.empty() && key != L"None" &&
+        coop::prop_element_tracker::ResolveLiveActorByKey(key, nullptr)) {
+        UE_LOGI("[PROP-DROP] HOST extract birth key='%ls' already exists -- AlreadyExists verdict "
+                "(the ledger will answer kOk exactly once)", key.c_str());
+        return coop::props::extract_pairing::JudgeBirth({/*actorLive=*/true, /*keyNonEmpty=*/true,
+                                                         /*observedKeyMatches=*/true,
+                                                         /*preExisting=*/true});
+    }
+    // The dup-guard above already answered the "host holds this key" case; the author here is
+    // HostSpawnPlacedProp directly (setKey-before-Finish + SpParity identity + scale +
+    // savedScalar), so the SUCCESS PROOF below can read the SPAWNED actor's own key back.
+    void* actor = HostSpawnPlacedProp(birth, cls, key);
+    if (!actor) {
+        UE_LOGW("[PROP-DROP] HOST extract birth spawn FAILED for key='%ls' cls='%ls' slot=%u -- "
+                "the authoritative birth could not be established this attempt", key.c_str(),
+                cls.c_str(), senderSlot);
+        return coop::props::extract_pairing::BirthVerdict::TransientFailure;
+    }
+    // REVIEW FINDING T (hardened success proof): the spawned POINTER alone proves nothing. The
+    // live actor's OWN key must BE the requested key -- otherwise no peer could ever converge
+    // to it by key and a kOk here would strand the extractor's adoption forever. A mis-keyed
+    // pointer is a zombie: reap it and report a transient failure so the ledger's bounded
+    // retry re-authors the birth (the retry's AlreadyExists probe cannot match a mis-keyed
+    // zombie, so there is no false-positive adopt path either).
+    const std::wstring observed = ue_wrap::prop::GetInteractableKeyString(actor);
+    const bool proven = !key.empty() && key != L"None" && observed == key;
+    if (!proven) {
+        UE_LOGW("[PROP-DROP] HOST extract birth key='%ls' NOT PROVEN on the spawned actor "
+                "(observed='%ls') -- the pointer is not the requested birth; reaping the "
+                "mis-keyed zombie and retrying (bounded)", key.c_str(), observed.c_str());
+        coop::prop_lifecycle::DestroyLocalProp(actor, /*deferred=*/false);
+        return coop::props::extract_pairing::BirthVerdict::TransientFailure;
+    }
+    UE_LOGI("[PROP-DROP] HOST spawned client-placed prop key='%ls' cls='%ls' slot=%u -- KEY "
+            "PROVEN on the live actor (B1_EXTRACT_HOST_KEY_PROVEN); FinishSpawn watcher "
+            "broadcasts it this tick", key.c_str(), cls.c_str(), senderSlot);
+    coop::dev::batch1_smoke::Emit("B1_EXTRACT_HOST_KEY_PROVEN", "slot=%u key='%ls'",
+                                  static_cast<unsigned>(senderSlot), key.c_str());
+    // (B1_EXTRACT_BIRTH_COMMIT is emitted by the pairing result sink when the ledger orders kOk
+    // -- the authoritative commit moment, covering both the Spawned and AlreadyExists paths.)
+    return coop::props::extract_pairing::JudgeBirth({/*actorLive=*/true, /*keyNonEmpty=*/true,
+                                                     /*observedKeyMatches=*/true,
+                                                     /*preExisting=*/false});
+}
+
+// KROFNE FORK (blocker E): CLIENT verdict for an extract pairing. Accept -> terminal success:
+// the tracking entry is erased and the actor is KEPT (the host's real PropSpawn adopts our local
+// copy by key -- host PropSpawn remains the converge mechanism). ANY accepted=0 (kRefused /
+// kExpired / v3's kBirthFailed) -> retire the local ghost, and the host's re-published container
+// truth puts the item back where it belongs.
+void OnContainerExtractResult(const coop::net::ContainerExtractResultPayload& p) {
+    UE_ASSERT_GAME_THREAD("prop_drop_intent::OnContainerExtractResult");
+    auto it = g_extractGhosts.find(p.extractToken);
+    if (it == g_extractGhosts.end()) return;   // unknown/expired token -- nothing pending
+    const ExtractGhost g = it->second;
+    g_extractGhosts.erase(it);                 // terminal EITHER way: no ghost leaks, no double retire
+    if (p.accepted) {
+        // Adopt path: the host's PropSpawn for this key converges with our local copy. Drop the
+        // tracking; keep the actor. THE TERMINAL SUCCESS STATE (v3 blocker M): the ghost map no
+        // longer holds the token, and nothing is destroyed.
+        UE_LOGI("[PROP-DROP] CLIENT extract token=%llu ACCEPTED (kOk) -- terminal: tracking "
+                "erased, the host birth adopts our copy by key",
+                static_cast<unsigned long long>(p.extractToken));
+        return;
+    }
+    if (p.reason == coop::net::container_extract_result::kBirthFailed) {
+        UE_LOGW("[PROP-DROP] CLIENT extract token=%llu kBirthFailed -- the host accepted the "
+                "mutation but could not establish the authoritative world birth (bounded retry "
+                "lapsed): the item is in NEITHER place on the host. Retiring our local ghost "
+                "(nothing backs it) -- REPORT this log", static_cast<unsigned long long>(p.extractToken));
+    } else {
+        UE_LOGW("[PROP-DROP] CLIENT extract token=%llu REJECTED (reason=%u) -- retiring the local "
+                "ghost; the host's re-published container truth stands",
+                static_cast<unsigned long long>(p.extractToken), static_cast<unsigned>(p.reason));
+    }
+    RetireLocalGhost(g.actor, g.idx,
+                     p.reason == coop::net::container_extract_result::kBirthFailed
+                         ? "extract birth failed (post-accept)"
+                         : "extract rejected");
+}
+
 void Reset() {
     UE_ASSERT_GAME_THREAD("prop_drop_intent::Reset");
     g_pending.clear();
     g_parkedKeys.clear();
     g_parkFifo.clear();
+    g_extractGhosts.clear();   // KROFNE FORK: extraction ghost tracking dies with the session
 }
 
 }  // namespace coop::prop_drop_intent

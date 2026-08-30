@@ -95,4 +95,42 @@ void WriteGateFields(void* drone, bool canTakeOff, bool hasSack);
 // container (Aprop_inventoryContainer_drone_C) so openPropInv opens it. Idempotent. Game thread.
 void RepointContainer(void* drone);
 
+// ---- KROFNE FORK (batch-1): the take-action lane's engine half -----------------------------
+// EXACT class compare against the resolved Adrone_C UClass -- the 0x45 filter matches the VERB
+// NAME alone, and `actionOptionIndex` is used by MANY classes (laptop, floppy box, keypad...);
+// discriminating the Context is the consumer's job (vm_dispatch.h). False before resolve.
+bool IsDrone(void* actor);
+
+// Read canTakeOff@0x0500 + hasSack@0x0501 off ANY drone instance (the HOST's native drone for
+// request validation, the client's mirror for the authoring filter). False if unresolved.
+bool ReadGateFields(void* drone, bool& canTakeOff, bool& hasSack);
+
+// HOST: dispatch the drone's OWN native `dropSack` UFunction (the causal verb the cargo-take
+// option runs -- bytecode RE 2026-06-08). Paramless per the probe census. This runs the vanilla
+// BP body on the host's authoritative actor: hasSack flip + departure FSM + the real cargo
+// spawn, all native -- we do NOT emulate the state change by hand. False if unresolved/failed.
+bool DispatchDropSack(void* drone);
+
+// ---- KROFNE FORK (corrective pass): the drone-sack phantom retire helpers -------------------
+
+// EXACT class compare against the resolved Aprop_dronesack_C UClass (the class the native
+// dropSack spawns; delivery_census_probe RE). False before the class resolves (retry until the
+// BP is loaded). The phantom capture + retire paths use this as their identity proof -- a
+// phantom is destroyed only when it IS a drone sack, never by proximity/heuristic.
+bool IsDroneSack(void* actor);
+
+// Set Aprop_dronesack_C::takenByDrone = true on `sackActor` by its REFLECTED FBoolProperty
+// descriptor {ByteOffset, ByteMask} (v3 HARDENING Q: reflection::FindBoolProperty, resolved once
+// on the sack's own class; the write is MASK-PRESERVING -- (byte & ~mask) | mask -- because UE
+// packs several `uint8 flag : 1` bitfields into shared bytes, and a whole-byte `= 1` would
+// clobber the property's packed neighbors). WHY THIS IS MANDATORY before any local destroy:
+// native b133
+// prop_dronesack_C::ReceiveDestroyed spawns a REPLACEMENT sack at the drone whenever
+// takenByDrone is false at destroy time; the native putSackOn sets takenByDrone=true and only
+// then K2_DestroyActor -- the flag is the engine's own "do not self-heal" bit. Retiring a
+// client-local phantom WITHOUT it would turn the cleanup into another phantom spawn (the exact
+// bug class the retire exists to end). False if the actor is not a drone sack or the property
+// cannot be resolved -- callers MUST treat false as "do not destroy" (fail closed).
+bool SetSackTakenByDrone(void* sackActor);
+
 }  // namespace ue_wrap::drone

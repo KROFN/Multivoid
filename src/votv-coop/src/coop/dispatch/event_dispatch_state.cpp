@@ -17,12 +17,14 @@
 #include "coop/items/player_inventory_sync.h"  // v73 inventory blob receiver
 #include "coop/voice/voice_chat.h"
 #include "coop/interactables/drone_sync.h"
+#include "coop/interactables/drone_take_sync.h"  // KROFNE FORK (2133): the drone take verdict
 #include "coop/interactables/grime_sync.h"
 #include "coop/interactables/interactable_sync.h"
 #include "coop/creatures/kerfur_convert_client.h"
 #include "coop/interactables/keypad_sync.h"
 #include "coop/interactables/power_sync.h"
 #include "coop/props/container_contents_sync.h"  // v124 (R11): the GObjStack slice lane
+#include "coop/props/prop_drop_intent.h"  // KROFNE FORK (corrective E): the extract-pairing verdict
 #include "coop/props/trash_pile_sync.h"
 #include "coop/interactables/turbine_sync.h"
 #include "coop/interactables/window_sync.h"
@@ -221,6 +223,61 @@ bool HandleStateEvent(net::Session& session,
             break;
         }
         coop::drone_sync::OnReliable(dp);
+        break;
+    }
+    case net::ReliableKind::DroneActionResult: {  // KROFNE FORK (2133): HOST->ONE CLIENT -- the
+                                                  // verdict for our DroneActionRequest nonce. The
+                                                  // client retires its captured local phantom either
+                                                  // way (see coop/drone_take_sync.h).
+        if (msg.senderPeerSlot != 0) {
+            UE_LOGW("event_feed: DroneActionResult from non-host senderPeerSlot=%d -- dropping",
+                    msg.senderPeerSlot);
+            break;
+        }
+        // KROFNE FORK (FIX J): EXACT size -- fixed-shape fork packet, no extension story.
+        if (msg.payloadLen != sizeof(net::DroneActionResultPayload)) {
+            UE_LOGW("event_feed: DroneActionResult payload size %zu != expected %zu -- dropping",
+                    static_cast<size_t>(msg.payloadLen), sizeof(net::DroneActionResultPayload));
+            break;
+        }
+        net::DroneActionResultPayload rp{};
+        std::memcpy(&rp, msg.payload, sizeof(rp));
+        // Trust-boundary: accepted is a uint8 but only 0/1 are meaningful.
+        if (rp.accepted != 0 && rp.accepted != 1) {
+            UE_LOGW("event_feed: DroneActionResult accepted=%u out of range -- dropping",
+                    static_cast<unsigned>(rp.accepted));
+            break;
+        }
+        coop::drone_take_sync::OnResult(rp);
+        break;
+    }
+    case net::ReliableKind::ContainerExtractResult: {  // KROFNE FORK (2133, corrective E): the
+                                                       // verdict for our extraction pairing --
+                                                       // accept = the host's PropSpawn adopts our
+                                                       // copy; reject = retire the local ghost.
+        if (msg.senderPeerSlot != 0) {
+            UE_LOGW("event_feed: ContainerExtractResult from non-host senderPeerSlot=%d -- dropping",
+                    msg.senderPeerSlot);
+            break;
+        }
+        // KROFNE FORK (FIX J): EXACT size -- fixed-shape fork packet, no extension story.
+        if (msg.payloadLen != sizeof(net::ContainerExtractResultPayload)) {
+            UE_LOGW("event_feed: ContainerExtractResult payload size %zu != expected %zu -- dropping",
+                    static_cast<size_t>(msg.payloadLen), sizeof(net::ContainerExtractResultPayload));
+            break;
+        }
+        net::ContainerExtractResultPayload xr{};
+        std::memcpy(&xr, msg.payload, sizeof(xr));
+        if (xr.accepted != 0 && xr.accepted != 1) {
+            UE_LOGW("event_feed: ContainerExtractResult accepted=%u out of range -- dropping",
+                    static_cast<unsigned>(xr.accepted));
+            break;
+        }
+        if (xr.extractToken == 0) {
+            UE_LOGW("event_feed: ContainerExtractResult with zero token -- dropping");
+            break;
+        }
+        coop::prop_drop_intent::OnContainerExtractResult(xr);
         break;
     }
     // (OrderRequest: moved to the INTENT family, event_dispatch_intent.cpp, 2026-07-10.)

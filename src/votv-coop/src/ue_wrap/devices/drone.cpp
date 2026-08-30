@@ -7,6 +7,7 @@
 #include "ue_wrap/devices/drone.h"
 
 #include "ue_wrap/core/call.h"
+#include "ue_wrap/core/bool_mask.h"  // KROFNE FORK v3 (HARDENING Q): mask-preserving bool writes
 #include "ue_wrap/engine/engine.h"
 #include "ue_wrap/core/fname_utils.h"
 #include "ue_wrap/core/log.h"
@@ -327,6 +328,116 @@ void RepointContainer(void* drone) {
         UE_LOGI("drone: repointed mirror container @0x%04X -> %p (prop-mirrored 'droneContainer')",
                 g_containerOff, c);
     }
+}
+
+// ---- KROFNE FORK (batch-1): the take-action lane's engine half -----------------------------
+
+bool IsDrone(void* actor) {
+    // EXACT class compare (not a descent walk): the drone singleton is Adrone_C itself, and an
+    // exact match is the tightest possible ctx gate for verbs whose name other classes share
+    // (actionOptionIndex multiplexes options on laptop/floppybox/keypad/... too).
+    if (!actor) return false;
+    if (!EnsureResolved() || !g_cls) return false;
+    return R::ClassOf(actor) == g_cls;
+}
+
+bool ReadGateFields(void* drone, bool& canTakeOff, bool& hasSack) {
+    if (!drone || !EnsureFxResolved() || g_canTakeOffOff < 0 || g_hasSackOff < 0) return false;
+    canTakeOff = *reinterpret_cast<const bool*>(reinterpret_cast<const char*>(drone) + g_canTakeOffOff);
+    hasSack    = *reinterpret_cast<const bool*>(reinterpret_cast<const char*>(drone) + g_hasSackOff);
+    return true;
+}
+
+bool DispatchDropSack(void* drone) {
+    if (!drone || !EnsureResolved() || !g_cls) return false;
+    // Resolve `dropSack` on the drone's OWN class (FindFunction is exact-owner -- no SuperStruct
+    // climb -- and Adrone_C declares it per the probe verb census). Paramless per the RE bytecode
+    // census (drone_probe registers it with no params).
+    static void* s_dropSackFn = nullptr;
+    if (!s_dropSackFn) s_dropSackFn = R::FindFunction(g_cls, L"dropSack");
+    if (!s_dropSackFn) {
+        UE_LOGW("drone: dropSack UFunction not found on drone_C -- cannot dispatch the native take");
+        return false;
+    }
+    ParamFrame f(s_dropSackFn);
+    if (!f.valid()) return false;
+    const bool ok = Call(drone, f);
+    if (ok) {
+        // Post-verify through observable state (the coin donor's discipline: the BP has no return
+        // value to check). A dispatch that ran but did not consume the cargo is a loud WARN, not a
+        // silent success -- the request was already accepted, so the client will retire its phantom
+        // and the next DroneState re-asserts whatever the host now holds.
+        bool canTakeOff = false, hasSack = true;
+        if (ReadGateFields(drone, canTakeOff, hasSack) && hasSack)
+            UE_LOGW("drone: dropSack dispatched but hasSack still true -- the native body did not "
+                    "consume the cargo (check the drone BP)");
+    }
+    return ok;
+}
+
+// ---- KROFNE FORK (corrective pass): the drone-sack phantom retire helpers -------------------
+
+namespace {
+
+// The sack's UClass, resolved once by short name (the delivery_census_probe pattern:
+// FindObjectsByClass(L"prop_dronesack_C") proves the short name resolves). The sack class is
+// load-on-demand game content -- it may legitimately be absent until the first delivery, so the
+// resolver RETRIES (returns false) instead of latching a failure.
+std::atomic<bool> g_sackResolveTried{false};
+void*     g_sackCls    = nullptr;
+int32_t   g_takenOff   = -1;      // Aprop_dronesack_C::takenByDrone (reflected FBoolProperty)
+uint8_t   g_takenMask  = 0;      // HARDENING Q (v3): the property's ByteMask -- UE packs several
+                                // `uint8 flag : 1` bitfields into shared bytes; the write must
+                                // set ONLY this property's bits, never the whole byte.
+
+bool EnsureSackResolved() {
+    if (g_sackCls && g_takenOff >= 0 && g_takenMask != 0) return true;
+    if (!g_sackCls) g_sackCls = R::FindClass(L"prop_dronesack_C");
+    if (!g_sackCls) return false;                       // BP not streamed in yet -- retry next call
+    if (g_takenOff < 0 || g_takenMask == 0) {
+        // HARDENING Q (v3): resolve the bool property by its FBoolProperty descriptor
+        // {ByteOffset, ByteMask} (reflection::FindBoolProperty) instead of a bare offset from
+        // FindPropertyOffset. takenByDrone is a BP bool; its byte can host OTHER packed
+        // bitfields, so the retire path must write mask-preservingly (byte & ~mask) | mask --
+        // a whole-byte `= 1` would clobber the neighbors.
+        int32_t off = -1;
+        uint8_t mask = 0;
+        if (!R::FindBoolProperty(g_sackCls, L"takenByDrone", off, mask) || off < 0 || mask == 0) {
+            // The class exists but the property does not (or carries no mask): a hard identity
+            // failure, not a load race. Latch it so we do not re-walk the property table every
+            // call, and fail every caller.
+            if (!g_sackResolveTried.exchange(true))
+                UE_LOGW("drone: prop_dronesack_C resolved but takenByDrone (FBoolProperty mask) "
+                        "NOT found -- phantom retire will refuse to destroy (fail closed)");
+            return false;
+        }
+        g_takenOff  = off;
+        g_takenMask = mask;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool IsDroneSack(void* actor) {
+    if (!actor) return false;
+    if (!EnsureSackResolved() || !g_sackCls) return false;
+    return R::ClassOf(actor) == g_sackCls;              // EXACT class -- the retire's identity proof
+}
+
+bool SetSackTakenByDrone(void* sackActor) {
+    // Why this exists (see drone.h): native ReceiveDestroyed self-heals a destroyed sack whose
+    // takenByDrone is still false -- the flag MUST be set before any local destroy of a phantom.
+    if (!sackActor || !EnsureSackResolved() || !g_sackCls) return false;
+    if (R::ClassOf(sackActor) != g_sackCls) return false;   // not a sack: refuse, never write blind
+    // HARDENING Q (v3): mask-preserving FBoolProperty write -- set ONLY takenByDrone's own mask
+    // bits and leave every packed neighbor bit in the byte untouched. Fail closed: an
+    // unresolvable (offset, mask) refuses the write entirely (the callers treat false as "do
+    // not destroy" -- a leftover ghost is recoverable, a clobbered bitfield byte is not).
+    if (g_takenOff < 0 || g_takenMask == 0) return false;
+    uint8_t* byte = reinterpret_cast<uint8_t*>(reinterpret_cast<char*>(sackActor) + g_takenOff);
+    *byte = ue_wrap::bool_mask::SetBoolMaskBits(*byte, g_takenMask);
+    return true;
 }
 
 }  // namespace ue_wrap::drone

@@ -15,6 +15,7 @@
 #include "coop/creatures/kerfur_command.h"
 #include "coop/creatures/kerfur_convert_host.h"
 #include "coop/creatures/roach_sync.h"    // v108: CLIENT->HOST local roach consumption intent
+#include "coop/interactables/drone_take_sync.h"  // KROFNE FORK (2133): the drone take request lane
 #include "coop/interactables/interactable_sync.h"
 #include "coop/items/order_sync.h"
 #include "coop/props/prop_drop_intent.h"  // v106 F2 Inc-1: CLIENT->HOST client-placed keyed prop
@@ -50,6 +51,31 @@ bool HandleIntentEvent(net::Session& session,
         }
         coop::order_sync::OnReliable(msg.payload, static_cast<int>(msg.payloadLen),
                                      static_cast<uint8_t>(msg.senderPeerSlot));
+        break;
+    }
+    case net::ReliableKind::DroneActionRequest: {  // KROFNE FORK (2133): CLIENT->HOST -- the client
+                                                   // observed its drone take; the host validates ITS
+                                                   // OWN drone + dispatches the native verb (see
+                                                   // coop/drone_take_sync.h for the full causal chain).
+        if (session.role() != net::Role::Host) {
+            UE_LOGW("event_feed: DroneActionRequest received on a client -- dropping");
+            break;
+        }
+        if (msg.senderPeerSlot < 1 || msg.senderPeerSlot >= net::kMaxPeers) {
+            UE_LOGW("event_feed: DroneActionRequest from invalid senderPeerSlot=%d -- dropping",
+                    msg.senderPeerSlot);
+            break;
+        }
+        // KROFNE FORK (FIX J): EXACT size -- these are fixed-shape fork packets with no extension
+        // story; an oversized payload is malformed, not forward-compatible. Fail closed.
+        if (msg.payloadLen != sizeof(net::DroneActionRequestPayload)) {
+            UE_LOGW("event_feed: DroneActionRequest payload size %zu != expected %zu -- dropping",
+                    static_cast<size_t>(msg.payloadLen), sizeof(net::DroneActionRequestPayload));
+            break;
+        }
+        net::DroneActionRequestPayload p{};
+        std::memcpy(&p, msg.payload, sizeof(p));
+        coop::drone_take_sync::OnRequest(session, p, static_cast<uint8_t>(msg.senderPeerSlot));
         break;
     }
     case net::ReliableKind::DoorOpenRequest: {
@@ -212,6 +238,33 @@ bool HandleIntentEvent(net::Session& session,
         net::PropDropIntentPayload p{};
         std::memcpy(&p, msg.payload, sizeof(p));
         coop::prop_drop_intent::OnPropDropIntent(session, p, static_cast<uint8_t>(msg.senderPeerSlot));
+        break;
+    }
+    case net::ReliableKind::ContainerExtractIntent: {  // KROFNE FORK (2133, corrective E): a
+                                                       // client takeObj birth birth-metadata +
+                                                       // token; the host PARKS it and authors the
+                                                       // birth ONLY when the paired contents
+                                                       // mutation carrying the same token returns
+                                                       // Applied from the CAS.
+        if (session.role() != net::Role::Host) {
+            UE_LOGW("event_feed: ContainerExtractIntent received on a client -- dropping");
+            break;
+        }
+        if (msg.senderPeerSlot < 1 || msg.senderPeerSlot >= net::kMaxPeers) {
+            UE_LOGW("event_feed: ContainerExtractIntent from invalid senderPeerSlot=%d -- dropping",
+                    msg.senderPeerSlot);
+            break;
+        }
+        // KROFNE FORK (FIX J): EXACT size -- fixed-shape fork packet, no extension story.
+        if (msg.payloadLen != sizeof(net::ContainerExtractIntentPayload)) {
+            UE_LOGW("event_feed: ContainerExtractIntent payload size %zu != expected %zu -- dropping",
+                    static_cast<size_t>(msg.payloadLen), sizeof(net::ContainerExtractIntentPayload));
+            break;
+        }
+        net::ContainerExtractIntentPayload ep{};
+        std::memcpy(&ep, msg.payload, sizeof(ep));
+        coop::prop_drop_intent::OnContainerExtractIntent(session, ep,
+                                                         static_cast<uint8_t>(msg.senderPeerSlot));
         break;
     }
     case net::ReliableKind::ReelEjectIntent: {  // v114 (L7): CLIENT->HOST -- a caddy/reelbox eject
