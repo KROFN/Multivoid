@@ -1,0 +1,93 @@
+name: import-batch1-e99
+
+on:
+  push:
+    branches:
+      - import/batch1-e99-carrier
+    paths:
+      - '.ci-import/batch1-e99/**'
+      - '.github/workflows/import-batch1-e99.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: import-batch1-e99
+  cancel-in-progress: false
+
+jobs:
+  reconstruct:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout carrier
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Reconstruct and verify exact handoff patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/batch1-e99.patch.bz2.b64"
+          : > "$out"
+          for n in $(seq -w 0 19); do
+            cat ".ci-import/batch1-e99/part-${n}.b64" >> "$out"
+          done
+          # part-20 is the exact concatenation of original chunks 20+21.
+          cat .ci-import/batch1-e99/part-20.b64 >> "$out"
+          cat .ci-import/batch1-e99/part-22.b64 >> "$out"
+          cat .ci-import/batch1-e99/part-23.b64 >> "$out"
+          # part-24 is the exact concatenation of original chunks 24+25.
+          cat .ci-import/batch1-e99/part-24.b64 >> "$out"
+
+          test "$(wc -c < "$out")" -eq 150432
+          echo 'bee320a0f5eb61fbc5a76bd1f3b442a07e231f8026479129325f5cbe488b7b2b  '"$out" | sha256sum -c -
+
+          base64 -d "$out" > "$RUNNER_TEMP/batch1-e99.patch.bz2"
+          echo 'd05f99e406f1e6039d14eee52caafc86e317218185f6aa272d951812d0cf608a  '"$RUNNER_TEMP/batch1-e99.patch.bz2" | sha256sum -c -
+
+          bunzip2 -c "$RUNNER_TEMP/batch1-e99.patch.bz2" > "$RUNNER_TEMP/batch1-e99.patch"
+          echo 'e66479c4c04cf3f33da007a875577cc821684f626ef26f24f8f4bb7529707d5f  '"$RUNNER_TEMP/batch1-e99.patch" | sha256sum -c -
+
+      - name: Apply patch to exact b133 and verify target tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=2f32d1affb9bdf10447d9145c166b4832d1e449f
+          TARGET_TREE=60996e9f24ad24e4caf6ae1d24b282c89896c785
+
+          git cat-file -e "$BASE^{commit}"
+          git checkout -B import/batch1-e99-reconstructed "$BASE"
+          git apply --index "$RUNNER_TEMP/batch1-e99.patch"
+          git diff --cached --check
+
+          tree="$(git write-tree)"
+          echo "reconstructed tree=$tree"
+          test "$tree" = "$TARGET_TREE"
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'import: exact batch1 e99 handoff tree'
+          test "$(git rev-parse HEAD^{tree})" = "$TARGET_TREE"
+
+      - name: Publish reconstructed commit to intermediate branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push --force origin HEAD:refs/heads/import/batch1-e99-reconstructed
+          echo "RECONSTRUCTED_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "RECONSTRUCTED_TREE=$(git rev-parse HEAD^{tree})" >> "$GITHUB_ENV"
+
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo '## Batch-1 exact reconstruction'
+            echo
+            echo "- commit: \`$RECONSTRUCTED_SHA\`"
+            echo "- tree: \`$RECONSTRUCTED_TREE\`"
+            echo '- expected tree: `60996e9f24ad24e4caf6ae1d24b282c89896c785`'
+            echo '- patch SHA256: `e66479c4c04cf3f33da007a875577cc821684f626ef26f24f8f4bb7529707d5f`'
+          } >> "$GITHUB_STEP_SUMMARY"
