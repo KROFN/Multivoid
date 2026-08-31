@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - import/actuator-recovery-carrier
+    paths:
+      - '.github/workflows/import-actuator-recovery.yml'
+      - '.ci-import/actuator-recovery-bz2/**'
 
 permissions:
   contents: write
