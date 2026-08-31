@@ -1,0 +1,50 @@
+name: import-actuator-recovery
+
+on:
+  push:
+    branches:
+      - import/actuator-recovery-carrier
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reconstruct verified actuator patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > /tmp/actuator.patch.bz2.b64
+          for i in 00 01 02 03; do
+            cat ".ci-import/actuator-recovery-bz2/chunk-$i.b64" >> /tmp/actuator.patch.bz2.b64
+          done
+          test "$(wc -c < /tmp/actuator.patch.bz2.b64)" -eq 25408
+          base64 -d /tmp/actuator.patch.bz2.b64 > /tmp/actuator.patch.bz2
+          echo "c76fd6ede3741dedc10f0f0d5c2ecc2ce40df2ff303c66d4a373b20373c9993c  /tmp/actuator.patch.bz2" | sha256sum -c -
+          bzip2 -dc /tmp/actuator.patch.bz2 > /tmp/actuator.patch
+          echo "929193fcea33ae1b9c4c7445e54e6c9ade6f970129f7ba6d27c05b8fa971ba4c  /tmp/actuator.patch" | sha256sum -c -
+
+      - name: Materialize exact reconstructed tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          git worktree add /tmp/actuator-src 1308aa5919d5e53fd9ba75eeb88370b0378da720
+          cd /tmp/actuator-src
+          test "$(git rev-parse HEAD^{tree})" = "60996e9f24ad24e4caf6ae1d24b282c89896c785"
+          git apply --index /tmp/actuator.patch
+          tree="$(git write-tree)"
+          echo "materialized tree=$tree"
+          test "$tree" = "8a901423701b18895727ef7bf71989bac6665520"
+          git config user.name "KROFN Actuator Recovery Import"
+          git config user.email "actions@users.noreply.github.com"
+          git commit -m "import(batch1): actuator-only recovery tree" \
+            -m "Recovered source HEAD: 4a6b65cfc704aba5337c00339d97bc33747f55ed" \
+            -m "Exact source tree: 8a901423701b18895727ef7bf71989bac6665520" \
+            -m "Base tree: 60996e9f24ad24e4caf6ae1d24b282c89896c785"
+          git push origin HEAD:refs/heads/krofne/b133-playability-batch1 --force
