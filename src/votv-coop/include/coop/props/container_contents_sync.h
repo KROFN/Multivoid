@@ -141,4 +141,14 @@ size_t SnapshotWorldContainers(WorldContainer* out, size_t want);
 // False if the eid does not resolve to a live world container on this peer.
 bool ContentsDigest(uint32_t eid, int32_t& outCount, float& outVol);
 
+// ---- KROFNE FORK (ACTUATOR-ONLY pass): the READ-ONLY extraction-baseline readout ------------
+// Dev-instrument OBSERVER for the extraction actuator's convergence gate (coop/dev/
+// extract_convergence.h): reports the base hash this peer last CONSUMED for the eid (0 = host
+// truth not yet applied) and the hash of the live local GObjStack slice under the production
+// ContentHash -- the two numbers "proven convergence" is defined on. WRITES NOTHING: no
+// g_baseHash/g_publishedHash mutation, no version bump, no CAS interaction -- the actuator gate
+// can wait for convergence but can never manufacture it. False if the eid does not resolve to a
+// live world container on this peer (the caller treats that as base=0: never fire). Game thread.
+bool DevBaselineReadout(uint32_t eid, uint64_t& outBaseHash, uint64_t& outLocalHash);
+
 }  // namespace coop::props::container_contents_sync

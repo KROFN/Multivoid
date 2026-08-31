@@ -2507,29 +2507,31 @@ def cmd_ctakerace(args) -> None:
         log("FAIL: host did not bind UDP"); tail_log(HOST_DIR / "multivoid.log", 30, "HOST"); kill_all(); sys.exit(1)
 
     log("--- CLIENT LAUNCH (race, role=client) ---")
-    launch_peer("client", args.port, "Client", peer="127.0.0.1", res_x=1280, res_y=720,
-                monitor=2, tile_index=0, memory_limit_gb=args.memory_limit_gb,
-                extra_env={"VOTVCOOP_RACE_ROLE": "client"})
+    client_pid = launch_peer("client", args.port, "Client", peer="127.0.0.1", res_x=1280, res_y=720,
+                             monitor=2, tile_index=0, memory_limit_gb=args.memory_limit_gb,
+                             extra_env={"VOTVCOOP_RACE_ROLE": "client"})
 
     host_log = HOST_DIR / "multivoid.log"
     client_log = CLIENT_DIR / "multivoid.log"
     ARRIVED = "director/ctake-race: ARRIVED"
     RESULT = "director/ctake-race: RESULT"
 
-    # Wait for BOTH peers to log ARRIVED, then drop the GO sentinel (a future timestamp ~1.5s out).
-    log(f"waiting up to {args.probe_timeout}s for BOTH peers to ARRIVE...")
-    both = False
-    for _ in range(args.probe_timeout):
-        time.sleep(1)
-        h = host_log.exists() and ARRIVED in host_log.read_text(errors="ignore")
-        c = client_log.exists() and ARRIVED in client_log.read_text(errors="ignore")
-        if h and c: both = True; break
-    if not both:
-        log("FAIL: both peers did not ARRIVE (world/join/walk). Tails:")
-        tail_log(host_log, 25, "HOST"); tail_log(client_log, 25, "CLIENT"); kill_all(); sys.exit(1)
+    # BOTH_READY barrier (ACTUATOR-ONLY pass): readiness is PER-ROLE, LATEST-ARRIVED, and
+    # ATTEMPT-SCOPED -- never bare marker PRESENCE (the old check: a stale ARRIVED line from a
+    # PREVIOUS session instance still in the log could satisfy the barrier). Only ARRIVED lines
+    # APPENDED to each log after THIS attempt started count; a peer process that exits withdraws
+    # ITS readiness only (the survivor stays ready and re-pairs when the peer re-proves under a
+    # new generation). ONE arrival starts NO GO clock: only BOTH roles proven ready drops the GO
+    # sentinel. A peer that never arrives expires into an explicit CTAKE TIMEOUT naming the
+    # missing role + an ABORT sentinel the waiting peer honors (it exits with a reason, NOT FIRED).
+    log(f"waiting up to {args.probe_timeout}s for BOTH peers to ARRIVE (per-role, attempt-scoped)...")
+    abort_file = Path(os.environ.get("TEMP") or os.environ.get("TMP") or str(ROOT)) / "multivoid_race_abort.txt"
+    try: abort_file.unlink()
+    except Exception: pass
+    os.environ["VOTVCOOP_RACE_ABORT_FILE"] = str(abort_file)
 
-    # Validate BOTH peers picked the SAME save-key (the by-construction shared target). A divergence
-    # means the key is not actually stable cross-peer (or the per-peer feasibility filter split them).
+    FIRED = "director/ctake-race: FIRED"
+
     def _last_str(log_path, needle, field):
         try: txt = log_path.read_text(errors="ignore")
         except Exception: return None
@@ -2539,17 +2541,103 @@ def cmd_ctakerace(args) -> None:
         if hit is None: return None
         m = re.search(re.escape(field) + r"=(\S+)", hit)
         return m.group(1) if m else None
-    hk = _last_str(host_log, ARRIVED, "key")
-    ck = _last_str(client_log, ARRIVED, "key")
-    if hk != ck:
-        log(f"!! SHARED-TARGET MISMATCH: host key={hk} != client key={ck} -- the peers did NOT pick the "
-            f"same container; the race would be meaningless. ABORT.")
-        tail_log(host_log, 15, "HOST"); tail_log(client_log, 15, "CLIENT"); kill_all(); sys.exit(1)
-    log(f"shared-target key MATCH on both peers: {hk}")
 
-    go_ms = int(time.time() * 1000) + 1500   # GO instant ~1.5s in the future (both busy-wait to it)
-    go_file.write_text(str(go_ms))
-    log(f"both ARRIVED -- GO sentinel written (fire at Unix-ms {go_ms}, ~1.5s out)")
+    def _scan_new_arrived(log_path, base_off):
+        """-> (latest ARRIVED marker offset or None, next read offset). Scans ONLY bytes appended
+        since base_off -- the attempt boundary that makes stale prior-attempt lines invisible."""
+        try:
+            with open(log_path, "rb") as f:
+                f.seek(base_off)
+                chunk = f.read()
+        except OSError:
+            return None, base_off
+        if not chunk:
+            return None, base_off
+        nxt = base_off + len(chunk)
+        latest, pos = None, 0
+        while True:
+            i = chunk.find(ARRIVED.encode(), pos)
+            if i < 0: break
+            eol = chunk.find(b"\n", i)
+            if eol < 0: break          # tail line still being written; completes on a later scan
+            latest = base_off + i
+            pos = eol + 1
+        return latest, nxt
+
+    def _peer_alive(pid):
+        """Disconnect-invalidation: True while the peer process is still running."""
+        if not pid: return False
+        try:
+            k32 = ctypes.windll.kernel32
+            h = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+            if not h: return False
+            code = wintypes.DWORD(0)
+            k32.GetExitCodeProcess(h, ctypes.byref(code))
+            k32.CloseHandle(h)
+            return code.value == 259                  # STILL_ACTIVE
+        except Exception:
+            return False
+
+    host_base = client_base = 0
+    host_arrived = client_arrived = None      # per-role LATEST ARRIVED under THIS attempt
+    both_ready = False
+    deadline = time.time() + args.probe_timeout
+    while time.time() < deadline:
+        time.sleep(1)
+        h_off, host_base = _scan_new_arrived(host_log, host_base)
+        if h_off is not None and h_off != host_arrived:
+            host_arrived = h_off
+            log(f"CTAKE ARRIVED host (attempt offset {h_off}) -- 1/2 roles ready; NO GO clock yet")
+        c_off, client_base = _scan_new_arrived(client_log, client_base)
+        if c_off is not None and c_off != client_arrived:
+            client_arrived = c_off
+            log(f"CTAKE ARRIVED client (attempt offset {c_off}) -- 1/2 roles ready; NO GO clock yet")
+        # disconnect-invalidation: a peer that exited withdraws ITS readiness (T3 semantics).
+        if host_arrived is not None and not _peer_alive(host_pid):
+            log("CTAKE ARRIVED host INVALIDATED (host process exited) -- readiness withdrawn")
+            host_arrived = None
+        if client_arrived is not None and not _peer_alive(client_pid):
+            log("CTAKE ARRIVED client INVALIDATED (client process exited) -- readiness withdrawn")
+            client_arrived = None
+        if host_arrived is not None and client_arrived is not None and not both_ready:
+            # Validate BOTH peers picked the SAME save-key (the by-construction shared target).
+            # A divergence means the key is not actually stable cross-peer -- the race would be
+            # meaningless, so the orchestrator refuses to drop GO.
+            hk = _last_str(host_log, ARRIVED, "key")
+            ck = _last_str(client_log, ARRIVED, "key")
+            if hk != ck:
+                log(f"!! SHARED-TARGET MISMATCH: host key={hk} != client key={ck} -- the peers did "
+                    f"NOT pick the same container; the race would be meaningless. ABORT.")
+                tail_log(host_log, 15, "HOST"); tail_log(client_log, 15, "CLIENT"); kill_all(); sys.exit(1)
+            both_ready = True
+            log(f"CTAKE BOTH_READY (host@{host_arrived} client@{client_arrived}) shared-key={hk}")
+            go_ms = int(time.time() * 1000) + 1500   # GO instant ~1.5s in the future (both busy-wait to it)
+            go_file.write_text(str(go_ms))
+            log(f"CTAKE GO -- sentinel written (fire at Unix-ms {go_ms}, ~1.5s out)")
+    if not both_ready:
+        missing = "host" if host_arrived is None else "client"
+        log(f"CTAKE TIMEOUT: {missing} never ARRIVED within {args.probe_timeout}s -- writing the "
+            f"ABORT sentinel so the waiting peer exits NOT FIRED (reason: {missing} never ARRIVED)")
+        try:
+            abort_file.write_text(f"orchestrator: {missing} never ARRIVED within "
+                                  f"{args.probe_timeout}s -- the race never became BOTH_READY")
+        except Exception:
+            pass
+        tail_log(host_log, 25, "HOST"); tail_log(client_log, 25, "CLIENT"); kill_all(); sys.exit(1)
+
+    # Observe the peers' FIRED lines (bounded): each fires AT the GO sentinel instant.
+    fire_deadline = time.time() + 30
+    fired_seen = {"host": False, "client": False}
+    while time.time() < fire_deadline and not all(fired_seen.values()):
+        time.sleep(1)
+        for role, lg in (("host", host_log), ("client", client_log)):
+            if fired_seen[role]: continue
+            try:
+                if FIRED in lg.read_text(errors="ignore"):
+                    fired_seen[role] = True
+                    log(f"CTAKE FIRED {role}")
+            except Exception:
+                pass
 
     # Wait for BOTH peers' RESULT, then SUM localCountAfter across peers.
     log("waiting for BOTH peers' RESULT...")

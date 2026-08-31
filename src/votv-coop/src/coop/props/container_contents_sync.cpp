@@ -1219,6 +1219,30 @@ bool ContentsDigest(uint32_t eid, int32_t& outCount, float& outVol) {
     return true;
 }
 
+// ---- KROFNE FORK (ACTUATOR-ONLY pass): the READ-ONLY baseline readout -----------------------
+// The extraction actuator (coop/dev/container_selftest) may fire only after PROVEN baseline
+// convergence for the container it is about to extract from. This accessor OBSERVES the two
+// numbers that define convergence -- the base this peer last consumed (g_baseHash; 0 = host
+// truth not yet applied) and the live local slice hashed by the SAME ContentHash the authoring
+// edge ships -- and WRITES NOTHING: no g_baseHash/g_publishedHash assignment, no version bump,
+// no CAS interaction, no STALE-BASE suppression. The convergence gate built on it physically
+// cannot manufacture convergence; it can only WAIT for it (L1-tested T2; gate G9b proves the
+// no-write span). Ordinary path byte-identical: this is a new, additive, read-only function.
+bool DevBaselineReadout(uint32_t eid, uint64_t& outBaseHash, uint64_t& outLocalHash) {
+    outBaseHash  = 0;
+    outLocalHash = 0;
+    if (!eid) return false;
+    if (auto it = g_baseHash.find(eid); it != g_baseHash.end()) outBaseHash = it->second;
+    void* actor = LivePropActor(eid);
+    if (!actor || !IsContainerActor(actor)) return false;
+    void* inv = InventoryOf(actor);
+    if (!inv || !IsWorldContainerInventory(inv)) return false;
+    std::vector<SR::SaveRecord> recs;
+    if (!ReadContents(inv, recs)) return false;
+    outLocalHash = ContentHash(eid, recs);
+    return true;
+}
+
 void OnDisconnect() {
     g_dirty.clear();
     g_retry.clear();

@@ -33,6 +33,7 @@
 
 #include "coop/config/config.h"               // ReadEnv (the codebase's env reader)
 #include "coop/player/players_registry.h"
+#include "coop/dev/director/ctake_barrier.h"   // ACTUATOR-ONLY pass: the pure BOTH_READY barrier
 #include "coop/props/prop_element_tracker.h"  // CollectKeyIndexEntries -- the stable save-key index
 #include "ue_wrap/actors/inventory.h"      // ResolveSaveSlot
 #include "ue_wrap/actors/prop.h"           // WalksToBase
@@ -48,6 +49,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -661,26 +663,69 @@ void* PickSharedContainer(void* player, int32_t& outCount, ue_wrap::FVector& out
     return nullptr;
 }
 
-// Wait on the orchestrator GO sentinel: mp.py writes a FUTURE Unix-ms into `goFile` once BOTH peers have
-// logged ARRIVED; each bot busy-waits to that instant -> sub-ms simultaneity on one box (shared clock,
-// /qf R2 / §B5). Returns true when the GO instant is reached; false on timeout (never hang).
-bool WaitForGo(const std::string& goFile, uint64_t timeoutMs) {
-    const uint64_t start = NowUnixMs();
-    uint64_t targetMs = 0;
-    while (NowUnixMs() - start < timeoutMs) {
-        if (targetMs == 0) {
+// READY -> GO barrier (ACTUATOR-ONLY pass, T3): the orchestrator's GO sentinel IS its BOTH_READY
+// proof -- mp.py writes the future-timestamp GO file ONLY after BOTH roles' LATEST ARRIVED under
+// the CURRENT attempt (per-role readiness, disconnect-invalidated, never bare marker presence).
+// The peer therefore runs NO clock of its own from its own ARRIVED -- the old bug: ONE 60s GO
+// timeout started at OUR arrival, so an early host could expire before a slow client even joined.
+// Phases:
+//   READY -- poll for the GO sentinel; honor an ABORT sentinel (the orchestrator gave up: a peer
+//            never ARRIVED) and exit with its reason, NOT FIRED.
+//   GO    -- busy-wait to the SENTINEL's future instant (sub-ms cross-peer simultaneity on one
+//            box, shared clock /qf R2 / §B5) -- the countdown is bounded by the sentinel, not us.
+// No GO within `timeoutMs` (VOTVCOOP_RACE_READY_TIMEOUT_MS, default 180000) expires into an
+// explicit NOT-FIRED. The empty-goFile solo-probe path (no orchestrator) is unchanged, see the
+// call site.
+bool WaitForBothReadyThenGo(const std::string& goFile, const std::string& abortFile, uint64_t timeoutMs) {
+    // ACTUATOR-ONLY pass (T3): the wait's STATES are the L1-tested barrier's, so the shipped
+    // BOTH_READY semantics are the SAME object the L1 tests prove. The peer observes its OWN
+    // arrival only -- ONE arrival starts NO GO clock (Phase::Waiting, no local countdown); the
+    // orchestrator's GO sentinel carries the OTHER role's proof (its BOTH_READY under the shared
+    // attempt generation), and the sentinel's future instant is the Go phase's deadline.
+    ctake_barrier::Gate barrier;
+    barrier.ObserveArrival(ctake_barrier::Role::Host, 1);   // role-symmetric: this peer's own arrival
+    for (;;) {
+        if (!abortFile.empty()) {
+            std::ifstream a(abortFile, std::ios::binary);
+            if (a) {
+                std::string reason;
+                std::getline(a, reason);
+                UE_LOGW("director/ctake-race: ABORT from orchestrator: %s -- NOT FIRED (the race "
+                        "never became BOTH_READY)", reason.c_str());
+                return false;
+            }
+        }
+        uint64_t targetMs = 0;
+        {
             std::ifstream f(goFile, std::ios::binary);
             if (f) { unsigned long long v = 0; if (f >> v && v > 0) targetMs = v; }
         }
         if (targetMs != 0) {
-            if (NowUnixMs() >= targetMs) return true;   // GO instant reached
-            ::Sleep(1);   // tight spin to the future timestamp
-        } else {
-            ::Sleep(20);  // poll for the sentinel to appear
+            // The sentinel IS the orchestrator's BOTH_READY proof: the other role's arrival under
+            // the same attempt generation -> the barrier pairs them. The countdown is bounded by
+            // the SENTINEL instant, never by us.
+            barrier.ObserveArrival(ctake_barrier::Role::Client, 1);
+            const auto ready = barrier.Tick(NowUnixMs(), /*goDelayMs=*/0, /*bothWaitMs=*/timeoutMs);
+            UE_LOGI("director/ctake-race: orchestrator GO sentinel = BOTH_READY proof (barrier "
+                    "phase %d) -- spinning to the SENTINEL instant (Unix-ms %llu)",
+                    (int)ready.phase, (unsigned long long)targetMs);
+            while (NowUnixMs() < targetMs) ::Sleep(1);   // tight spin to the SENTINEL instant
+            const auto go = barrier.Tick(NowUnixMs(), /*goDelayMs=*/0, /*bothWaitMs=*/timeoutMs);
+            UE_LOGI("director/ctake-race: GO reached (barrier phase %d mayFire=%d; fire at Unix-ms %llu)",
+                    (int)go.phase, go.mayFire ? 1 : 0, (unsigned long long)targetMs);
+            return true;
         }
+        // Still READY-waiting: the barrier owns the readiness ceiling and expires into an
+        // explicit terminal TimedOut that can never fire.
+        const auto d = barrier.Tick(NowUnixMs(), /*goDelayMs=*/0, /*bothWaitMs=*/timeoutMs);
+        if (d.phase == ctake_barrier::Phase::TimedOut) {
+            UE_LOGW("director/ctake-race: BOTH_READY wait timed out (%llums ceiling, barrier "
+                    "terminal) -- the orchestrator never sent GO (a peer never ARRIVED?) -- NOT FIRED",
+                    (unsigned long long)timeoutMs);
+            return false;
+        }
+        ::Sleep(20);   // poll for the sentinels
     }
-    UE_LOGW("director/ctake-race: GO sentinel timed out (%llums) file=%s", (unsigned long long)timeoutMs, goFile.c_str());
-    return false;
 }
 
 }  // namespace
@@ -758,8 +803,21 @@ void RunContainerRace() {
     UE_LOGI("director/ctake-race: ARRIVED role=%s key=%ls open=%d slot=%d -- waiting for GO",
             role.c_str(), pb->targetKey.c_str(), pb->openCalled ? 1 : 0, pb->slotFound ? 1 : 0);
 
-    // Barrier: wait on the orchestrator GO (future-timestamp), then fire the faithful take AT the GO instant.
-    const bool go = goFile.empty() ? true : WaitForGo(goFile, /*timeoutMs=*/60000);
+    // Barrier (ACTUATOR-ONLY pass): READY phase first -- the orchestrator's GO sentinel is its
+    // BOTH_READY proof; an ABORT sentinel or the readiness ceiling exits with a reason, NOT
+    // FIRED -- then the GO countdown bounded by the SENTINEL instant. Empty goFile = the
+    // documented solo-probe path (no orchestrator): unchanged, fires immediately.
+    uint64_t readyMs = 180000;   // VOTVCOOP_RACE_READY_TIMEOUT_MS
+    {
+        const std::string envReady = EnvStr("VOTVCOOP_RACE_READY_TIMEOUT_MS");
+        if (!envReady.empty()) {
+            const unsigned long long v = strtoull(envReady.c_str(), nullptr, 0);
+            if (v > 0) readyMs = static_cast<uint64_t>(v);
+        }
+    }
+    const bool go = goFile.empty()
+                  ? true
+                  : WaitForBothReadyThenGo(goFile, EnvStr("VOTVCOOP_RACE_ABORT_FILE"), readyMs);
     if (go && shouldTake) {
         RunGT([pb](std::atomic<int>& d) {
             void* ui = FirstLiveOfClass(L"ui_playerInventory_C");

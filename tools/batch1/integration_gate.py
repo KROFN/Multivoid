@@ -32,6 +32,13 @@
 #       DoShutdown close-signal call sites + IsShuttingDown) is untouched. Regression for the
 #       runtime-proven Wine hang fix: the opt-in gate must remove ONLY the WM_GETTEXT hang,
 #       never any install step.
+#   G9  the ACTUATOR-ONLY pass's static faithfulness wiring (ported from
+#       scripts/actuator-recon-red/red2_gate_wiring_probe.py, RED on pristine e99ae6da as
+#       12/14 FAIL): the drone actuator fires through the production verb dispatch and sends
+#       nothing itself, drone_probe_take defaults FALSE; the extraction readout exists in the
+#       production header/TU and its span NEVER writes the CAS maps; the CTAKE peer no longer
+#       runs an own-arrival GO timeout, honors ABORT, and mp.py gates GO on BOTH_READY with
+#       per-role ARRIVED resolution. Static wiring guards -- they never replace the runtime.
 #
 # Runs BEFORE the expensive dependency build (pure stdlib; the G6 probe uses whatever
 # C++ compiler is on PATH -- the same one CI then configures the DLL with).
@@ -439,6 +446,77 @@ def main():
               f"DoShutdown/IsShuttingDown definitions missing from {shutdown_rel}")
     else:
         fail("G8a", f"{shutdown_rel} missing from the tree -- cannot verify the Wine headless gate")
+
+    # ---- G9: the ACTUATOR-ONLY pass's static faithfulness wiring ---------------------------
+    # Ported verbatim (structure and strings) from the RED-2 wiring probe. DRONE-A*/EXTRACT-B*/
+    # CTAKE-C* names match the probe's output so the RED log and the gate read as one story.
+    def rd(rel):
+        return strip_cpp_comments(read(os.path.join(VOTVCOOP, rel)))
+
+    dp = rd("src/coop/dev/drone_probe.cpp")
+    check("G9a", "DispatchDropSack" in dp,
+          "DRONE-A1 drone_probe.cpp fires the take through the production native verb dispatch "
+          "(DispatchDropSack)",
+          "DRONE-A1 drone_probe.cpp does not dispatch the mirror's own dropSack verb -- the take "
+          "would not enter the 0x45 seam")
+    check("G9a", "drone_take_gate" in dp,
+          "DRONE-A2 drone_probe.cpp consumes the pure drone_take_gate FSM "
+          "(readiness/one-shot/timeout)",
+          "DRONE-A2 drone_probe.cpp does not consume the pure drone_take_gate FSM")
+    check("G9a", "SendCritical" not in dp and "send_backlog" not in dp,
+          "DRONE-A3 drone_probe.cpp sends NO network request directly (the seam authors the "
+          "request)",
+          "DRONE-A3 drone_probe.cpp references SendCritical/send_backlog -- a dev actuator must "
+          "NEVER send network requests directly")
+    rows = rd("include/coop/config/config_registry_rows.inc")
+    check("G9a",
+          re.search(r'CFG_FLAG\(\s*drone_probe_take\s*,\s*"drone_probe_take"\s*,\s*"dev"\s*,\s*false',
+                    rows) is not None,
+          "DRONE-A4 config row drone_probe_take exists and defaults to FALSE (off by default)",
+          "DRONE-A4 the drone_probe_take row is missing or does not default to FALSE")
+
+    cs = rd("src/coop/dev/container_selftest.cpp")
+    check("G9b", "extract_convergence" in cs,
+          "EXTRACT-B1 container_selftest.cpp consumes the pure extract_convergence gate",
+          "EXTRACT-B1 container_selftest.cpp does not consume the extract_convergence gate")
+    check("G9b", "DevBaselineReadout" in cs,
+          "EXTRACT-B2 container_selftest.cpp reads the baseline via the read-only dev readout",
+          "EXTRACT-B2 container_selftest.cpp does not read the DevBaselineReadout")
+    ccs = rd("src/coop/props/container_contents_sync.cpp")
+    hdr = rd("include/coop/props/container_contents_sync.h")
+    check("G9b", "DevBaselineReadout" in ccs and "DevBaselineReadout" in hdr,
+          "EXTRACT-B3 DevBaselineReadout is declared in the production header and defined in the "
+          "TU (dev-instrument seam)",
+          "EXTRACT-B3 DevBaselineReadout missing from the production header or the TU definition")
+    m = re.search(r"bool DevBaselineReadout\(", ccs)
+    span = ccs[m.start():m.start() + 4000] if m else ""
+    span = span[:span.find("\n}\n")] if span else ""
+    check("G9b", m is not None and "g_baseHash[" not in span.replace("g_baseHash.find", "")
+          and "g_publishedHash[" not in span and "g_baseHash =" not in span
+          and "g_publishedHash =" not in span,
+          "EXTRACT-B4 DevBaselineReadout NEVER writes g_baseHash/g_publishedHash (no "
+          "manufactured convergence)",
+          "EXTRACT-B4 DevBaselineReadout's span assigns g_baseHash/g_publishedHash -- the "
+          "readout must stay READ-ONLY (convergence must not be manufacturable)")
+
+    ct = rd("src/coop/dev/director/container_take_probe.cpp")
+    check("G9c", "ctake_barrier" in ct,
+          "CTAKE-C1 container_take_probe.cpp consumes the pure ctake_barrier FSM",
+          "CTAKE-C1 container_take_probe.cpp does not consume the ctake_barrier FSM")
+    check("G9c", re.search(r"WaitForGo\([^)]*60000", ct) is None,
+          "CTAKE-C2 the 60s GO timeout no longer starts at the peer's OWN arrival",
+          "CTAKE-C2 an own-arrival 60s GO timeout is back -- BOTH_READY must gate GO")
+    check("G9c", "ABORT" in ct or "abort" in ct,
+          "CTAKE-C3 the peer honors an explicit orchestrator ABORT (one peer never arrived)",
+          "CTAKE-C3 the peer does not honor an ABORT sentinel")
+    mp_text = read(os.path.join(HERE, "..", "mp.py"))
+    check("G9c", "BOTH_READY" in mp_text,
+          "CTAKE-C4 mp.py logs an explicit CTAKE BOTH_READY phase before writing GO",
+          "CTAKE-C4 mp.py has no BOTH_READY phase before GO")
+    check("G9c", re.search(r"ARRIVED role=%|ARRIVED role=", mp_text) is not None
+          or "ARRIVED host" in mp_text,
+          "CTAKE-C5 mp.py resolves per-role ARRIVED (latest line), not a presence check",
+          "CTAKE-C5 mp.py does not resolve per-role ARRIVED")
 
     # ---- summary ----------------------------------------------------------------------------
     print(f"\n== gate: {CHECKS} checks, {len(FAILURES)} failures ==")

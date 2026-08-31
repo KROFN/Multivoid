@@ -30,6 +30,9 @@
 #include "coop/interactables/drone_take_sync.h"
 #include "coop/interactables/drone_replay_domain.h"
 #include "coop/dev/batch1_smoke.h"
+#include "coop/dev/drone_take_gate.h"          // ACTUATOR-ONLY pass: drone take one-shot gate (T1)
+#include "coop/dev/extract_convergence.h"      // ACTUATOR-ONLY pass: extraction baseline gate (T2)
+#include "coop/dev/director/ctake_barrier.h"   // ACTUATOR-ONLY pass: CTAKE BOTH_READY barrier (T3)
 #include "ue_wrap/core/bool_mask.h"
 
 #include <cstdio>
@@ -853,6 +856,264 @@ int main() {
         CHECK(!rl.RateOk(2500, 1000), "S1: and the limiter re-arms from the new timestamp");
         RateLimiter fresh;
         CHECK(fresh.RateOk(999999, 1000), "S1: a fresh slot allows immediately (first milestone)");
+    }
+
+    // ---- T1 (ACTUATOR-ONLY pass): the drone client-Take actuator's pure gate ------------------
+    // The actuator itself (coop/dev/drone_probe.cpp, ini drone_probe_take=1) dispatches the
+    // mirror drone's OWN dropSack verb -- the same ProcessEvent path a player's Take option
+    // runs -- so the REAL 0x45 seam authors the request. What is unit-tested here is the
+    // decision half: never fire before the parked-with-cargo state, fire EXACTLY once, never
+    // re-arm, never fire while a take request is in flight, terminal timeout that cannot fire.
+    {
+        using namespace coop::dev::drone_take_gate;
+        using D = Decision;
+        // 1. disabled by default: no input combination ever fires.
+        {
+            Gate g;
+            bool fired = false;
+            for (uint64_t t = 0; t <= 1000; t += 100)
+                if (g.Tick(t, /*enabled=*/false, true, true, false).action == Action::Fire) fired = true;
+            CHECK(!fired && g.phase() == Phase::Disabled,
+                  "T1: a disabled gate never fires (default OFF is a hard never-fire)");
+        }
+        // 2. does not fire before the actionable state; the wait is armed on the mirror sighting.
+        {
+            Gate g;
+            const D notReady = g.Tick(1000, true, true, /*ready=*/false, false);
+            CHECK(notReady.action == Action::None && notReady.phase == Phase::Arming,
+                  "T1: no fire before the parked-with-cargo state (NOT-READY diagnostics)");
+            const D noDrone = g.Tick(2000, true, /*dronePresent=*/false, true, false);
+            CHECK(noDrone.action == Action::None,
+                  "T1: no fire without the client mirror Adrone_C sighting");
+        }
+        // 3. readiness must HOLD kReadyHoldTicks consecutive ticks before the single fire.
+        {
+            Gate g;
+            Action last = Action::None;
+            for (int i = 0; i < kReadyHoldTicks - 1; ++i)
+                last = g.Tick(3000 + uint64_t(i), true, true, true, false).action;
+            CHECK(last == Action::None, "T1: the ready hold is not satisfied early");
+            const D fire = g.Tick(3000 + kReadyHoldTicks, true, true, true, false);
+            CHECK(fire.action == Action::Fire && fire.phase == Phase::Fired,
+                  "T1: exactly on the kReadyHoldTicks-th consecutive ready tick the gate fires ONCE");
+        }
+        // 4. fires exactly once and never re-arms.
+        {
+            Gate g;
+            int fires = 0;
+            for (uint64_t t = 0; t < 50; ++t)
+                if (g.Tick(10000 + t, true, true, true, false).action == Action::Fire) ++fires;
+            CHECK(fires == 1, "T1: 50 ready ticks produce EXACTLY ONE fire (no re-arm)");
+            CHECK(g.phase() == Phase::Done && g.fired(),
+                  "T1: after the fire the gate is permanently Done");
+        }
+        // 5. never fires while a take request is already in flight (ours or a human's).
+        {
+            Gate g;
+            bool fired = false;
+            for (uint64_t t = 0; t < 100; ++t)
+                if (g.Tick(1000 + t, true, true, /*ready=*/true, /*pendingTake=*/true).action == Action::Fire)
+                    fired = true;
+            CHECK(!fired, "T1: a pending take request blocks the actuator fire completely");
+            // and the hold is CONSECUTIVE: ready again from zero after the pending clears.
+            const D d = g.Tick(2000, true, true, true, false);
+            CHECK(d.action == Action::None, "T1: after a pending take the hold restarts from zero");
+        }
+        // 6. the wait timeout is TERMINAL and mutates nothing: TimedOut can never fire, ever.
+        {
+            Gate g;
+            g.Tick(1000, true, true, false, false);                 // arm at 1000
+            const D to = g.Tick(1000 + kWaitTimeoutMs + 1, true, true, false, false);
+            CHECK(to.phase == Phase::TimedOut && to.action == Action::None,
+                  "T1: the delivery wait expires into an explicit NOT-FIRED terminal state");
+            bool fired = false;
+            for (uint64_t t = 0; t < 100; ++t)
+                if (g.Tick(1000 + kWaitTimeoutMs + 10 + t, true, true, true, false).action == Action::Fire)
+                    fired = true;
+            CHECK(!fired, "T1: after the timeout even permanent readiness cannot fire (timeout "
+                          "leaves gameplay state untouched -- the FSM has no such output)");
+        }
+        // 7. a late drone sighting arms the clock THEN (slow world loads do not eat the budget).
+        {
+            Gate g;
+            const D pre = g.Tick(10 * kWaitTimeoutMs, true, false, true, false);
+            CHECK(pre.action == Action::None && pre.phase == Phase::Arming,
+                  "T1: without the mirror the gate waits (and does not accrue timeout)");
+            const D arm = g.Tick(10 * kWaitTimeoutMs + 1, true, true, false, false);
+            CHECK(arm.action == Action::None && arm.phase == Phase::Arming,
+                  "T1: the wait clock arms at the FIRST mirror sighting");
+        }
+    }
+
+    // ---- T2 (ACTUATOR-ONLY pass): the extraction actuator's baseline-convergence gate ---------
+    // Node2 evidence: the old selftest fired the client extract on a FIXED +25s timer -- before
+    // the client had consumed the host's published baseline (base=0) -- and the host's CAS
+    // REFUSED it (STALE BASE, author base=0). The gate below makes the actuator WAIT for proven
+    // convergence (base != 0 && local == base) and fire exactly once; it has NO way to write a
+    // base/version, so it cannot manufacture convergence -- only wait for it.
+    {
+        using namespace coop::dev::extract_convergence;
+        using O = Observation;
+        using D = Decision;
+        // 1. does not fire when the baseline is absent (base=0 = host truth not yet consumed).
+        {
+            Gate g;
+            const D d = g.Tick(1000, O{0, 12345});
+            CHECK(d.action == Action::None && d.phase == Phase::Waiting,
+                  "T2: no fire without a consumed baseline (base=0) -- the Node2 STALE BASE shape");
+        }
+        // 2. does not fire when the base is mismatched (local drifted / newer truth pending).
+        {
+            Gate g;
+            const D d = g.Tick(1000, O{0xABCD, 0x1234});
+            CHECK(d.action == Action::None && d.phase == Phase::Waiting,
+                  "T2: no fire while local content != consumed baseline (would be refused)");
+        }
+        // 3. waits through a stale baseline for as long as it lasts (no fixed-timer fire).
+        {
+            Gate g;
+            bool fired = false;
+            for (uint64_t t = 0; t < 500; ++t)
+                if (g.Tick(1000 + t, O{0xAA, 0xBB}).action == Action::Fire) fired = true;
+            CHECK(!fired, "T2: 500 stale ticks produce no fire (waits THROUGH the stale baseline)");
+        }
+        // 4. fires ONCE, immediately, on proven convergence -- and never again.
+        {
+            Gate g;
+            (void)g.Tick(1000, O{0x77, 0x99});                      // stale first
+            const D fire = g.Tick(1001, O{0x77, 0x77});             // converged
+            CHECK(fire.action == Action::Fire && fire.phase == Phase::Fired,
+                  "T2: proven convergence (base!=0, local==base) fires the ONE real extract");
+            const D after = g.Tick(1002, O{0x77, 0x77});
+            CHECK(after.phase == Phase::Done && after.action == Action::None,
+                  "T2: the convergence gate is permanently inert after its one fire");
+            int fires = 0;
+            for (uint64_t t = 0; t < 100; ++t)
+                if (g.Tick(1100 + t, O{0x77, 0x77}).action == Action::Fire) ++fires;
+            CHECK(fires == 0, "T2: converged observations after the fire never re-fire");
+        }
+        // 5. the timeout is TERMINAL and leaves production state untouched (no fire, ever).
+        {
+            Gate g;
+            (void)g.Tick(1000, O{0, 0});
+            const D to = g.Tick(1000 + kWaitTimeoutMs + 1, O{0, 0});
+            CHECK(to.phase == Phase::TimedOut && to.action == Action::None,
+                  "T2: the baseline wait expires into an explicit NOT-FIRED terminal state");
+            const D late = g.Tick(1000 + kWaitTimeoutMs + 2, O{0x77, 0x77});
+            CHECK(late.action == Action::None,
+                  "T2: after the timeout even a converged observation cannot fire");
+        }
+        // 6. convergence is defined by EQUALITY ONLY -- contradictory observations cannot
+        //    manufacture it (the gate has no write path to any base/version at all).
+        {
+            Gate g;
+            bool fired = false;
+            const uint64_t bases[]  = {1, 2, 3, 0, 5, 0xABCD};
+            const uint64_t locals[] = {9, 8, 7, 6, 4, 0x1234};   // deliberately NO base==local pair
+            for (uint64_t t = 0; t < 6; ++t)
+                if (g.Tick(1000 + t, O{bases[t], locals[t]}).action == Action::Fire) fired = true;
+            CHECK(!fired, "T2: arbitrary observations never fire -- only exact base==local equality does");
+        }
+    }
+
+    // ---- T3 (ACTUATOR-ONLY pass): the CTAKE race's BOTH_READY barrier --------------------------
+    // The old peer orchestration ran ONE 60s GO-timeout from the peer's OWN ARRIVED -- "HOST
+    // ARRIVED" alone started the clock and a slow client let the host expire WITHOUT a GO.
+    // mp.py additionally tested readiness by PRESENCE, so a stale ARRIVED from a previous
+    // session instance could satisfy BOTH_READY. The barrier below is the shipped semantics.
+    {
+        using namespace coop::director::ctake_barrier;
+        constexpr uint64_t kGoDelay = 1500, kBothWait = 120000;
+        // 1. HOST ARRIVED alone cannot start a GO timeout (or a GO anything).
+        {
+            Gate b;
+            b.ObserveArrival(Role::Host, 7);
+            const Decision d = b.Tick(1000, kGoDelay, kBothWait);
+            CHECK(d.phase == Phase::Waiting && !d.mayFire && d.event == Event::None,
+                  "T3: HOST ARRIVED alone starts NO GO clock (barrier keeps waiting)");
+        }
+        // 2. CLIENT ARRIVED alone: symmetric.
+        {
+            Gate b;
+            b.ObserveArrival(Role::Client, 7);
+            const Decision d = b.Tick(1000, kGoDelay, kBothWait);
+            CHECK(d.phase == Phase::Waiting && !d.mayFire && d.event == Event::None,
+                  "T3: CLIENT ARRIVED alone starts NO GO clock");
+        }
+        // 3. both ARRIVED (one shared generation) starts ONLY the BOTH_READY phase, then GO.
+        {
+            Gate b;
+            b.ObserveArrival(Role::Host, 7);
+            b.ObserveArrival(Role::Client, 7);
+            const Decision br = b.Tick(1000, kGoDelay, kBothWait);
+            CHECK(br.event == Event::BothReady && br.phase == Phase::BothReady && !br.mayFire,
+                  "T3: BOTH_READY is proven before any GO exists");
+            const Decision pre = b.Tick(1000 + kGoDelay - 1, kGoDelay, kBothWait);
+            CHECK(pre.phase == Phase::BothReady && !pre.mayFire,
+                  "T3: the GO countdown runs AFTER BOTH_READY, never from a single arrival");
+            const Decision go = b.Tick(1000 + kGoDelay, kGoDelay, kBothWait);
+            CHECK(go.event == Event::Go && go.mayFire && go.phase == Phase::Go,
+                  "T3: GO (the only mayFire) arrives strictly after BOTH_READY + delay");
+        }
+        // 4. a disconnect / generation change invalidates readiness BEFORE GO.
+        {
+            Gate b;
+            b.ObserveArrival(Role::Host, 7);
+            b.ObserveArrival(Role::Client, 7);
+            (void)b.Tick(1000, kGoDelay, kBothWait);                // BOTH_READY
+            b.InvalidateGeneration(7);
+            const Decision d = b.Tick(1001, kGoDelay, kBothWait);
+            CHECK(d.phase == Phase::Waiting && !d.mayFire && d.event == Event::None,
+                  "T3: a generation change withdraws BOTH_READY (readiness invalidated)");
+        }
+        // 5. stale readiness from a previous peer generation can NEVER satisfy BOTH_READY.
+        {
+            Gate b;
+            b.ObserveArrival(Role::Host, 1);
+            b.ObserveArrival(Role::Client, 1);
+            b.InvalidateGeneration(1);                              // the client dropped + rejoined
+            b.ObserveArrival(Role::Client, 2);                      // fresh proof, new generation
+            const Decision stale = b.Tick(1000, kGoDelay, kBothWait);
+            CHECK(stale.phase == Phase::Waiting && stale.event == Event::None && !stale.mayFire,
+                  "T3: the host's gen-1 readiness cannot pair with the client's gen-2 (stale)");
+            b.ObserveArrival(Role::Host, 2);                        // the host re-proves under gen 2
+            const Decision ok = b.Tick(1001, kGoDelay, kBothWait);
+            CHECK(ok.event == Event::BothReady,
+                  "T3: BOTH_READY needs BOTH roles under the CURRENT shared generation");
+        }
+        // 6. the BOTH-peers wait expires into an explicit, role-naming, never-firing timeout.
+        {
+            Gate b;
+            b.ObserveArrival(Role::Host, 7);
+            (void)b.Tick(1000, kGoDelay, kBothWait);                // the wait anchors at first sight
+            const Decision to = b.Tick(1000 + kBothWait + 1, kGoDelay, kBothWait);
+            CHECK(to.phase == Phase::TimedOut && to.event == Event::TimedOut && !to.mayFire,
+                  "T3: one peer never ARRIVED -> explicit timeout naming the missing role");
+            const Decision after = b.Tick(1000 + kBothWait + 2, kGoDelay, kBothWait);
+            CHECK(after.phase == Phase::TimedOut && !after.mayFire,
+                  "T3: the timeout is terminal -- a late arrival cannot resurrect the race");
+        }
+        // 7. arrivals that disagree on the generation never satisfy BOTH_READY while waiting.
+        {
+            Gate b;
+            b.ObserveArrival(Role::Host, 1);
+            b.ObserveArrival(Role::Client, 2);
+            const Decision d = b.Tick(1000, kGoDelay, kBothWait);
+            CHECK(d.phase == Phase::Waiting && d.event == Event::None && !d.mayFire,
+                  "T3: mismatched arrival generations are the stale-readiness case -- no BOTH_READY");
+        }
+        // 8. after GO the race is underway: a generation change does not rewind the barrier.
+        {
+            Gate b;
+            b.ObserveArrival(Role::Host, 3);
+            b.ObserveArrival(Role::Client, 3);
+            (void)b.Tick(1000, kGoDelay, kBothWait);
+            (void)b.Tick(1000 + kGoDelay, kGoDelay, kBothWait);     // GO
+            b.InvalidateGeneration(3);
+            const Decision d = b.Tick(1000 + kGoDelay + 1, kGoDelay, kBothWait);
+            CHECK(d.phase == Phase::Go,
+                  "T3: post-GO invalidation is recorded but the barrier stays in Go");
+        }
     }
 
     std::printf("== %d checks, %d failures ==\n", g_total, g_fail);

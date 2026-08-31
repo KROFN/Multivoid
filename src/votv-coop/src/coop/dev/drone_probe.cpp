@@ -3,13 +3,16 @@
 #include "coop/dev/drone_probe.h"
 
 #include "coop/config/config.h"
+#include "coop/dev/drone_take_gate.h"   // ACTUATOR-ONLY pass: the pure one-shot take gate
 #include "ue_wrap/core/call.h"
 #include "ue_wrap/core/game_thread.h"
 #include "ue_wrap/core/log.h"
 #include "ue_wrap/core/reflection.h"
+#include "ue_wrap/devices/drone.h"      // ACTUATOR-ONLY pass: the production verb-dispatch seam
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -17,13 +20,27 @@
 namespace coop::dev::drone_probe {
 namespace {
 
-namespace R  = ue_wrap::reflection;
-namespace GT = ue_wrap::game_thread;
+namespace R   = ue_wrap::reflection;
+namespace GT  = ue_wrap::game_thread;
+namespace D   = ue_wrap::drone;              // ACTUATOR-ONLY pass: the production engine half
+namespace DTG = coop::dev::drone_take_gate;  // ACTUATOR-ONLY pass: the pure take gate
 
 bool ProbeEnabled() {
     static const bool s_enabled = coop::config::ResolveFlag(::coop::config_registry::rows::drone_probe);
     return s_enabled;
 }
+
+// ACTUATOR-ONLY pass (T1): the faithful client Take actuator's switch. Default OFF (the config
+// row's default); the actuator itself is CLIENT-only -- it never runs on the host.
+bool TakeEnabled() {
+    static const bool s_on = coop::config::ResolveFlag(::coop::config_registry::rows::drone_probe_take);
+    return s_on;
+}
+
+// A dispatch of the mirror's OWN dropSack verb was observed (the actuator's or a human player's):
+// a take request is in flight until the cargo is observed consumed (hasSack false). The take
+// gate consumes this as pendingTake, so the actuator can never fire into a take already underway.
+bool g_takeVerbPending = false;
 
 // ---- observer identification table -----------------------------------------
 // One shared callback identifies which UFunction fired by comparing the dispatched
@@ -48,6 +65,9 @@ void OnDroneVerb(void* self, void* function, void* /*params*/) {
             }
             return;
         }
+        // ACTUATOR-ONLY pass: ANY dropSack dispatch on the mirror = a take request in flight.
+        if (TakeEnabled() && std::strcmp(g_watched[i].name, "drone.dropSack") == 0)
+            g_takeVerbPending = true;
         UE_LOGI("[drone_probe] VERB FIRED: %s (self=%p cls='%ls') -- ProcessEvent-DISPATCHED = OBSERVABLE",
                 g_watched[i].name, self, cls.c_str());
         return;
@@ -198,6 +218,63 @@ void PlaceClientOrder(void* gm, void* gmCls) {
             "(ORDER PLACED [#7] = shop reachable + order is CLIENT-LOCAL).", ok ? 1 : 0);
 }
 
+// ---- ACTUATOR-ONLY pass (T1): the faithful client Take (ini drone_probe_take=1) -------------
+// After the REAL delivery lands on the client mirror, fire EXACTLY ONE faithful player Take:
+// D::DispatchDropSack(mirror) -- the mirror drone's OWN dropSack UFunction via ProcessEvent, the
+// very path the BP's take option (option 7) runs. The dispatch ENTERS the existing Batch-1 0x45
+// seam, so the SHIPPED drone_take_sync lane authors the request; the HOST validates against its
+// own drone and runs its own native dropSack; the authoritative real sack + phantom handling are
+// entirely the shipped implementation's. This code sends NO network request itself, calls NO
+// host handler, writes NO drone/sack state, and after the dispatch only OBSERVES the existing
+// B1_* instrumentation. The decision half is the L1-tested pure gate (drone_take_gate.h): never
+// fire before the parked-with-cargo state (canTakeOff && hasSack through the production
+// D::ReadGateFields -- exactly the gates a player's Take option needs, held kReadyHoldTicks
+// consecutive ticks), never fire into an in-flight take, exactly one fire, no re-arm, terminal
+// NOT-FIRED after the 5-min delivery wait.
+uint64_t TakeNowMs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+DTG::Gate  g_takeGate;
+DTG::Phase g_takeLastPhase = DTG::Phase::Disabled;
+bool       g_takeIdentityLogged = false;
+
+// One actuator decision tick. Called with the live mirror from drone_probe::Tick, and with
+// dronePresent=false from the mirror-absence early-return so the readiness hold restarts and
+// the wall-clock delivery wait keeps running while the mirror is gone.
+void TakeActuatorTick(bool dronePresent, void* drone) {
+    bool canTakeOff = false, hasSack = false;
+    const bool gates = dronePresent && D::ReadGateFields(drone, canTakeOff, hasSack);
+    if (gates && !hasSack) g_takeVerbPending = false;   // the in-flight take resolved (cargo gone)
+
+    const auto d = g_takeGate.Tick(TakeNowMs(), /*enabled=*/true, dronePresent,
+                                   /*ready=*/gates && canTakeOff && hasSack,
+                                   /*pendingTake=*/g_takeVerbPending);
+    if (d.phase != g_takeLastPhase) {   // diagnostics on STATE CHANGE only (NOT-READY/FIRED/TIMEOUT)
+        g_takeLastPhase = d.phase;
+        const char* nm = d.phase == DTG::Phase::Arming
+                             ? "NOT-READY (Arming -- waiting for the parked-with-cargo state)"
+                             : d.phase == DTG::Phase::Fired   ? "FIRED"
+                             : d.phase == DTG::Phase::Done
+                                   ? "DONE (fired exactly once; no re-arm -- observing the B1_* chain)"
+                                   : d.phase == DTG::Phase::TimedOut
+                                         ? "TIMEOUT (terminal NOT-FIRED after the 5-min delivery wait)"
+                                         : "DISABLED";
+        UE_LOGI("[drone_probe] TAKE: %s", nm);
+    }
+    if (d.action == DTG::Action::Fire) {
+        UE_LOGI("[drone_probe] TAKE: FIRING the faithful client take -- D::DispatchDropSack(%p) "
+                "dispatches the mirror's OWN dropSack (the player-Take path); the 0x45 seam "
+                "authors the request, this code sends nothing itself", drone);
+        const bool dispatched = D::DispatchDropSack(drone);
+        UE_LOGI("[drone_probe] TAKE: dispatched=%d -- now OBSERVING the existing Batch-1 chain "
+                "(B1_DRONE_VERB -> REQ -> HOST_ACCEPT -> NATIVE_DROPSACK -> PHANTOM_CAPTURE -> "
+                "RESULT -> REAL_SACK)", dispatched ? 1 : 0);
+    }
+}
+
 }  // namespace
 
 void Install() {
@@ -252,6 +329,9 @@ void Tick(bool connected, bool isHost) {
             UE_LOGI("[drone_probe] mainGamemode.drone is NULL/dead right now (gm=%p) -- "
                     "drone may be dormant/un-spawned; watching for it.", gm);
         }
+        // ACTUATOR-ONLY pass: the gate still ticks without the mirror (the readiness hold
+        // restarts; the wall-clock delivery wait keeps running -- absence eats nothing).
+        if (TakeEnabled()) TakeActuatorTick(/*dronePresent=*/false, nullptr);
         return;
     }
     g_droneAbsenceLogged = false;
@@ -378,6 +458,19 @@ void Tick(bool connected, bool isHost) {
             if (isHost) TriggerHostDelivery(gm, gmCls, drone, dCls);
             else        PlaceClientOrder(gm, gmCls);
         }
+    }
+
+    // ---- ACTUATOR-ONLY pass: the faithful client Take (CLIENT only, default OFF) -------------
+    // Identity is proven twice: the mainGamemode.drone singleton this Tick resolved, and the
+    // exact-class D::IsDrone proof (the seam's B1_DRONE_VERB line echoes the same pointer).
+    if (TakeEnabled() && connected && !isHost && drone && R::IsLive(drone) && D::IsDrone(drone)) {
+        if (!g_takeIdentityLogged) {
+            g_takeIdentityLogged = true;
+            UE_LOGI("[drone_probe] TAKE: identity proof -- mainGamemode.drone=%p cls='%ls' "
+                    "IsDrone=1 (exact Adrone_C); the seam's B1_DRONE_VERB line echoes this pointer",
+                    drone, R::ClassNameOf(drone).c_str());
+        }
+        TakeActuatorTick(/*dronePresent=*/true, drone);
     }
 }
 

@@ -254,6 +254,11 @@ CFG_FLAG(drone_probe, "drone_probe", "dev", false, nullptr,
     "Diagnostic probe: delivery drone state.")
 CFG_FLAG(drone_probe_drive, "drone_probe_drive", "dev", false, nullptr,
     "Diagnostic probe: drive the delivery drone (test driver).")
+CFG_FLAG(drone_probe_take, "drone_probe_take", "dev", false, nullptr,
+    "Actuator (CLIENT, default off): after the real delivery lands on the client mirror, fire "
+    "EXACTLY ONE faithful player Take -- the mirror's own dropSack verb via the 0x45 seam, so "
+    "the shipped Batch-1 request lane authors the take. Requires drone_probe+drone_probe_drive; "
+    "after the dispatch it only observes the existing B1_* instrumentation.")
 CFG_FLAG(pile_dup_probe, "pile_dup_probe", "dev", false, nullptr,
     "Diagnostic probe: pile duplicate/identity mismatches.")
 CFG_FLAG(perf_probe, "perf_probe", "dev", false, nullptr,
