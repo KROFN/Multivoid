@@ -63,7 +63,6 @@ jobs:
           "VCPKG_ROOT=$root" | Out-File -Append $env:GITHUB_ENV
           Write-Host "Pinned vcpkg root restored to $root"
 
-      # Cheap contract: ~27 s total in the previous measured run. Keep it.
       - name: LOGIC PASS
         working-directory: src/votv-coop
         shell: cmd
@@ -132,8 +131,6 @@ jobs:
           "toolset=$toolset" | Out-File -Append $env:GITHUB_OUTPUT
           "image=$env:ImageVersion" | Out-File -Append $env:GITHUB_OUTPUT
 
-      # The old lane spent 3m24s UPLOADING the entire vcpkg git clone after the build,
-      # while a cold clone+bootstrap itself took only 21s. Do not cache VCPKG_ROOT.
       - name: Install pinned vcpkg (no repo-cache upload)
         shell: pwsh
         run: |
@@ -144,8 +141,6 @@ jobs:
           & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
           if ($LASTEXITCODE -ne 0) { throw 'bootstrap-vcpkg failed' }
 
-      # Stable cache generation: deliberately NOT keyed by SOURCE_TREE.
-      # Gameplay-only source edits reuse the same compiled baseline and MSBuild recompiles deltas.
       - name: Restore persistent MSVC build state
         id: buildcache
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
@@ -153,8 +148,6 @@ jobs:
           path: ${{ env.BUILD_DIR }}
           key: msvc-build-v1-${{ runner.os }}-${{ steps.vs.outputs.toolset }}-${{ hashFiles('src/votv-coop/vcpkg.json', 'src/votv-coop/CMakeLists.txt') }}
 
-      # Seed the first fast build from the dependency cache produced by the previous slow lane.
-      # Once the full build-state cache exists, this step is skipped on warm runs.
       - name: Restore legacy vcpkg_installed seed on build-cache miss
         if: steps.buildcache.outputs.cache-hit != 'true'
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
@@ -165,15 +158,16 @@ jobs:
       - name: Configure (cached CMake + pinned vcpkg)
         shell: pwsh
         run: |
+          $toolchain = Join-Path $env:VCPKG_ROOT 'scripts/buildsystems/vcpkg.cmake'
+          $triplet = $env:VCPKG_TRIPLET
           cmake -S src/votv-coop -B $env:BUILD_DIR `
             -G "${{ steps.vs.outputs.generator }}" -A x64 `
-            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
-            -DVCPKG_TARGET_TRIPLET=$env:VCPKG_TRIPLET `
-            -DVCPKG_MANIFEST_MODE=ON `
-            -DCMAKE_C_FLAGS="/MP4 /FS" `
-            -DCMAKE_CXX_FLAGS="/MP4 /FS"
+            "-DCMAKE_TOOLCHAIN_FILE=$toolchain" `
+            "-DVCPKG_TARGET_TRIPLET=$triplet" `
+            "-DVCPKG_MANIFEST_MODE=ON" `
+            "-DCMAKE_C_FLAGS=/MP4 /FS" `
+            "-DCMAKE_CXX_FLAGS=/MP4 /FS"
 
-      # Build ONLY the actual mod DLL. /MP4 parallelizes TUs; --parallel 4 parallelizes MSBuild projects.
       - name: MSVC COMPILE + LINK (parallel, DLL target only)
         shell: pwsh
         run: cmake --build $env:BUILD_DIR --config Release --target votv-coop --parallel 4
