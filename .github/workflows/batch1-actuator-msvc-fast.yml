@@ -1,0 +1,206 @@
+name: batch1-actuator-msvc-fast
+
+on:
+  push:
+    branches:
+      - import/actuator-recovery-carrier
+    paths:
+      - '.github/workflows/batch1-actuator-msvc-fast.yml'
+      - '.ci-fast-trigger'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: batch1-actuator-msvc-fast
+  cancel-in-progress: true
+
+jobs:
+  fast:
+    name: Fast exact-tree Windows x64 Release
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      SOURCE_SHA: b34d2ef08dc2ce51b4de0b46cb89f6e1b114067a
+      SOURCE_TREE: 8a901423701b18895727ef7bf71989bac6665520
+      VCPKG_ROOT: ${{ github.workspace }}\vcpkg-tool
+      VCPKG_TRIPLET: x64-windows-static
+      BUILD_DIR: build/votv-coop
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          submodules: false
+          fetch-depth: 1
+
+      - name: Verify exact source tree
+        shell: pwsh
+        run: |
+          $head = (git rev-parse HEAD).Trim()
+          $tree = (git rev-parse 'HEAD^{tree}').Trim()
+          Write-Host "HEAD=$head"
+          Write-Host "TREE=$tree"
+          if ($head -ne $env:SOURCE_SHA) { throw "source commit mismatch: $head" }
+          if ($tree -ne $env:SOURCE_TREE) { throw "source tree mismatch: $tree" }
+
+      - name: Init build submodules (third_party only)
+        shell: pwsh
+        run: git submodule update --init --recursive --depth 1 src/votv-coop/third_party
+
+      - name: MSVC dev environment
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x64
+
+      - name: Restore pinned VCPKG_ROOT after VS environment setup
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:GITHUB_WORKSPACE 'vcpkg-tool'
+          "VCPKG_ROOT=$root" | Out-File -Append $env:GITHUB_ENV
+          Write-Host "Pinned vcpkg root restored to $root"
+
+      # Cheap contract: ~27 s total in the previous measured run. Keep it.
+      - name: LOGIC PASS
+        working-directory: src/votv-coop
+        shell: cmd
+        run: |
+          cl /nologo /EHsc /std:c++20 /utf-8 /W3 /I include ^
+            tests\batch1_corrective_selftest.cpp ^
+            src\coop\items\save_record_wire.cpp ^
+            src\coop\interactables\signal_wire.cpp ^
+            /Fe:${{ github.workspace }}\batch1_logic.exe
+          ${{ github.workspace }}\batch1_logic.exe
+
+      - name: MODEL PASS
+        working-directory: src/votv-coop
+        shell: cmd
+        run: |
+          cl /nologo /EHsc /std:c++20 /utf-8 /W3 /I include ^
+            tests\batch1_model_selftest.cpp ^
+            src\coop\items\save_record_wire.cpp ^
+            src\coop\interactables\signal_wire.cpp ^
+            /Fe:${{ github.workspace }}\batch1_model.exe
+          ${{ github.workspace }}\batch1_model.exe
+
+      - name: FUZZ PASS
+        working-directory: src/votv-coop
+        shell: cmd
+        run: |
+          cl /nologo /EHsc /std:c++20 /utf-8 /W3 /O1 /I include ^
+            tests\batch1_fuzz_selftest.cpp ^
+            src\coop\items\save_record_wire.cpp ^
+            src\coop\interactables\signal_wire.cpp ^
+            /Fe:${{ github.workspace }}\batch1_fuzz.exe
+          ${{ github.workspace }}\batch1_fuzz.exe 10000 0xB1F00D5EED
+
+      - name: BUILD-GRAPH PASS
+        shell: pwsh
+        working-directory: src/votv-coop
+        run: |
+          python ..\..\tools\batch1\integration_gate.py
+          exit $LASTEXITCODE
+
+      - name: Read vcpkg pin
+        id: baseline
+        shell: pwsh
+        run: |
+          $baseline = (Get-Content src/votv-coop/vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
+          if ($baseline -notmatch '^[0-9a-f]{40}$') { throw "bad builtin-baseline: '$baseline'" }
+          "sha=$baseline" | Out-File -Append $env:GITHUB_OUTPUT
+          Write-Host "vcpkg pin=$baseline"
+
+      - name: Detect Visual Studio toolchain
+        id: vs
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $major = & $vswhere -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property catalog_productLineVersion
+          if (-not $major) { $major = & $vswhere -latest -property catalog_productLineVersion }
+          $major = "$major".Trim()
+          $yearMap = @{ '16'='2019'; '17'='2022'; '18'='2026'; '19'='2029' }
+          $year = $yearMap[$major]
+          if (-not $year) { throw "Unrecognized Visual Studio major '$major'" }
+          $generator = "Visual Studio $major $year"
+          $inst = & $vswhere -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $toolset = (Get-Content (Join-Path "$inst".Trim() 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt') -Raw).Trim()
+          Write-Host "generator=$generator toolset=$toolset image=$env:ImageVersion"
+          "generator=$generator" | Out-File -Append $env:GITHUB_OUTPUT
+          "toolset=$toolset" | Out-File -Append $env:GITHUB_OUTPUT
+          "image=$env:ImageVersion" | Out-File -Append $env:GITHUB_OUTPUT
+
+      # The old lane spent 3m24s UPLOADING the entire vcpkg git clone after the build,
+      # while a cold clone+bootstrap itself took only 21s. Do not cache VCPKG_ROOT.
+      - name: Install pinned vcpkg (no repo-cache upload)
+        shell: pwsh
+        run: |
+          $pin = '${{ steps.baseline.outputs.sha }}'
+          if (Test-Path $env:VCPKG_ROOT) { Remove-Item -Recurse -Force $env:VCPKG_ROOT }
+          git clone --filter=blob:none https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
+          git -C $env:VCPKG_ROOT checkout --force $pin
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw 'bootstrap-vcpkg failed' }
+
+      # Stable cache generation: deliberately NOT keyed by SOURCE_TREE.
+      # Gameplay-only source edits reuse the same compiled baseline and MSBuild recompiles deltas.
+      - name: Restore persistent MSVC build state
+        id: buildcache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.BUILD_DIR }}
+          key: msvc-build-v1-${{ runner.os }}-${{ steps.vs.outputs.toolset }}-${{ hashFiles('src/votv-coop/vcpkg.json', 'src/votv-coop/CMakeLists.txt') }}
+
+      # Seed the first fast build from the dependency cache produced by the previous slow lane.
+      # Once the full build-state cache exists, this step is skipped on warm runs.
+      - name: Restore legacy vcpkg_installed seed on build-cache miss
+        if: steps.buildcache.outputs.cache-hit != 'true'
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.BUILD_DIR }}/vcpkg_installed
+          key: vcpkg-installed-${{ hashFiles('src/votv-coop/vcpkg.json') }}-${{ steps.vs.outputs.image }}-${{ steps.vs.outputs.toolset }}
+
+      - name: Configure (cached CMake + pinned vcpkg)
+        shell: pwsh
+        run: |
+          cmake -S src/votv-coop -B $env:BUILD_DIR `
+            -G "${{ steps.vs.outputs.generator }}" -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=$env:VCPKG_TRIPLET `
+            -DVCPKG_MANIFEST_MODE=ON `
+            -DCMAKE_C_FLAGS="/MP4 /FS" `
+            -DCMAKE_CXX_FLAGS="/MP4 /FS"
+
+      # Build ONLY the actual mod DLL. /MP4 parallelizes TUs; --parallel 4 parallelizes MSBuild projects.
+      - name: MSVC COMPILE + LINK (parallel, DLL target only)
+        shell: pwsh
+        run: cmake --build $env:BUILD_DIR --config Release --target votv-coop --parallel 4
+
+      - name: Collect DLL + provenance
+        id: artname
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'artifact'
+          New-Item -ItemType Directory $out | Out-Null
+          $dlls = @(Get-ChildItem "$env:BUILD_DIR/Release/multivoid-*.dll")
+          if ($dlls.Count -ne 1) { throw "expected exactly one multivoid DLL, got $($dlls.Count)" }
+          $d = $dlls[0]
+          Copy-Item $d.FullName $out
+          $h = (Get-FileHash -Algorithm SHA256 $d.FullName).Hash.ToLowerInvariant()
+          "source-commit: $env:SOURCE_SHA" | Out-File (Join-Path $out 'build-info.txt')
+          "source-tree: $env:SOURCE_TREE" | Out-File -Append (Join-Path $out 'build-info.txt')
+          "dll-sha256: $h" | Out-File -Append (Join-Path $out 'build-info.txt')
+          "build-cache-hit: ${{ steps.buildcache.outputs.cache-hit }}" | Out-File -Append (Join-Path $out 'build-info.txt')
+          Write-Host "$($d.Name) sha256=$h"
+          "name=batch1-fast-$($env:SOURCE_SHA.Substring(0,12))" | Out-File -Append $env:GITHUB_OUTPUT
+          "dir=$out" | Out-File -Append $env:GITHUB_OUTPUT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.artname.outputs.name }}
+          path: ${{ steps.artname.outputs.dir }}
+          retention-days: 14
+          if-no-files-found: error
