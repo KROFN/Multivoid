@@ -136,7 +136,7 @@ jobs:
         run: |
           $pin = '${{ steps.baseline.outputs.sha }}'
           if (Test-Path $env:VCPKG_ROOT) { Remove-Item -Recurse -Force $env:VCPKG_ROOT }
-          git clone --filter=blob:none https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
+          git clone https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
           git -C $env:VCPKG_ROOT checkout --force $pin
           & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
           if ($LASTEXITCODE -ne 0) { throw 'bootstrap-vcpkg failed' }
